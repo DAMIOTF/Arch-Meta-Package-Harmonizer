@@ -34,16 +34,6 @@ cargo build --release --locked
 makepkg -si
 ```
 
-## Screenshots
-
-![Scan output](img/scan.png)
-
-![Cleanup output](img/clean.png)
-
-![Full scan dashboard](img/full-scan.png)
-
-![Dependency analysis](img/analyze2.png)
-
 ## Usage
 
 ```bash
@@ -72,3 +62,12 @@ amph full-scan --json dashboard.json --markdown dashboard.md
 - `history` reads the local scan log created by `amph`.
 - `analyze`, `report`, and `full-scan` save scan history after a successful analysis.
 - The tool expects `pacman` to be available, so it is intended for Arch Linux and compatible derivatives.
+
+## Screenshots
+![analyze1](img/analyze1.png)
+![analyze2](img/analyze2.png)
+![clean](img/clean.png)
+![cleanup_suggestion](img/cleanup_suggestion.png)
+![full-scan](img/full-scan.png)
+![loading](img/loading.png)
+![scan](img/scan.png)
