@@ -1,0 +1,30 @@
+[package]
+name = "arch-meta-package-harmonizer"
+version = "1.13.1"
+edition = "2024"
+authors = ["DAMIOTF dmtf.ovh"]
+description = "A CLI diagnostic tool for analyzing Arch Linux installed packages and system health"
+license = "MIT"
+
+[[bin]]
+name = "amph"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+colored = "2"
+tabled = "0.15"
+comfy-table = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+indicatif = "0.18"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
+
+
