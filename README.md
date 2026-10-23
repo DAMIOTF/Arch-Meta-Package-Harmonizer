@@ -1,4 +1,4 @@
-# amph — Arch Meta Package Harmonizer
+# amph: Arch Meta Package Harmonizer
 
 **v0.2-beta · Arch Linux only**
 
@@ -14,39 +14,47 @@
 
 ## Screenshots
 
-<table>
-  <tr>
-    <td align="center"><strong>Dashboard</strong><br><img src="img/dashboard.png" alt="amph dashboard" width="480"></td>
-    <td align="center"><strong>Packages</strong><br><img src="img/packages.png" alt="Package inventory" width="480"></td>
-  </tr>
-  <tr>
-    <td align="center"><strong>Dependency graph</strong><br><img src="img/graph.png" alt="Dependency graph" width="480"></td>
-    <td align="center"><strong>Cleanup</strong><br><img src="img/cleanup.png" alt="Cleanup preview" width="480"></td>
-  </tr>
-  <tr>
-    <td align="center"><strong>Harmony</strong><br><img src="img/harmony.png" alt="Harmony categories and suggestions" width="480"></td>
-    <td align="center"><strong>Checks</strong><br><img src="img/checks.png" alt="System checks" width="480"></td>
-  </tr>
-  <tr>
-    <td align="center"><strong>Timeline</strong><br><img src="img/timeline.png" alt="Pacman transaction timeline" width="480"></td>
-    <td align="center"><strong>Tokyo Night</strong><br><img src="img/theme_tokyo.png" alt="Tokyo Night theme" width="480"></td>
-  </tr>
-  <tr>
-    <td align="center"><strong>Gruvbox</strong><br><img src="img/theme_gruvbox.png" alt="Gruvbox theme" width="480"></td>
-    <td align="center"><strong>Nord</strong><br><img src="img/theme_nord.png" alt="Nord theme" width="480"></td>
-  </tr>
-</table>
+<details>
+<summary>Application views</summary>
+
+![Dashboard](img/dashboard.png)
+
+![Packages](img/packages.png)
+
+![Dependency graph](img/graph.png)
+
+![Cleanup](img/cleanup.png)
+
+![Harmony](img/harmony.png)
+
+![System checks](img/checks.png)
+
+![Pacman timeline](img/timeline.png)
+
+</details>
+
+<details>
+<summary>Color themes</summary>
+
+![Tokyo Night](img/theme_tokyo.png)
+
+![Gruvbox](img/theme_gruvbox.png)
+
+![Nord](img/theme_nord.png)
+
+</details>
 
 ## Install
 
+The installer builds the current release and installs to `$CARGO_HOME/bin` or `~/.cargo/bin` by default. A user install does not need `sudo`.
+
 ```sh
-cargo build --release --locked
-install -Dm755 target/release/amph "$HOME/.cargo/bin/amph"
-hash -r
-amph --version
+git clone https://github.com/DAMIOTF/Arch-Meta-Package-Harmonizer.git
+cd Arch-Meta-Package-Harmonizer
+./install.sh
 ```
 
-This user-local install takes precedence over `/usr/local/bin` on the standard Arch `PATH`. For a system-wide install, replace `/usr/local/bin/amph` with the built binary using `sudo install -Dm755 target/release/amph /usr/local/bin/amph`. Or build the Arch package with `makepkg -si`.
+For a system-wide installation, run `./install.sh --system`. To build and check the destination without installing, use `./install.sh --dry-run`. If your shell still resolves an older binary, run `hash -r`. You can also install the Arch package with `makepkg -si`.
 
 ## Use
 
@@ -89,4 +97,6 @@ cargo test --locked
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-MIT licensed. See [LICENSE](LICENSE).
+## License
+
+Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE). This is source-available, not OSI-approved open source. The license does not grant commercial use, including sale. Redistribution must include the license terms and the `Required Notice` identifying DAMIOTF. Third-party dependencies retain their own licenses.

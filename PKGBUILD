@@ -4,7 +4,7 @@ pkgrel=1
 pkgdesc='Arch Linux package harmonizer with a ratatui TUI and scriptable CLI'
 arch=('x86_64' 'aarch64')
 url='https://github.com/DAMIOTF/Arch-Meta-Package-Harmonizer'
-license=('MIT')
+license=('custom:PolyForm-Noncommercial-1.0.0')
 depends=('glibc' 'pacman')
 makedepends=('cargo')
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v0.2-beta.tar.gz")
@@ -26,7 +26,7 @@ check() {
 }
 
 package() {
-  cd "${srcdir}/Arch-Meta-Package-Harmonizer-${pkgver}"
+  cd "${srcdir}/Arch-Meta-Package-Harmonizer-0.2-beta"
   install -Dm755 "target/release/${pkgname}" "${pkgdir}/usr/bin/${pkgname}"
   install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
   install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"

@@ -4,7 +4,7 @@ version = "0.2.0-beta"
 edition = "2024"
 authors = ["DAMIOTF dmtf.ovh"]
 description = "A CLI and TUI package harmonizer for Arch Linux"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [[bin]]
 name = "amph"
