@@ -52,9 +52,9 @@ done
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$WORK_DIR"' EXIT
 
-SCRIPT_PATH="${BASH_SOURCE[0]:-}"
+SCRIPT_PATH="$0"
 SCRIPT_DIR=""
-if [[ -n "$SCRIPT_PATH" && -f "$SCRIPT_PATH" ]]; then
+if [[ "$SCRIPT_PATH" != "bash" && "$SCRIPT_PATH" != "-bash" && -f "$SCRIPT_PATH" ]]; then
 	SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
 fi
 
