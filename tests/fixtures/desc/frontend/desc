@@ -1,0 +1,17 @@
+%NAME%
+frontend
+
+%VERSION%
+1.0-1
+
+%DESC%
+Fixture consumer of app
+
+%SIZE%
+75
+
+%REASON%
+1
+
+%DEPENDS%
+app

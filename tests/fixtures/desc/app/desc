@@ -1,0 +1,25 @@
+%NAME%
+app
+
+%VERSION%
+1.0-1
+
+%DESC%
+A fixture application package
+
+%SIZE%
+2048
+
+%REASON%
+1
+
+%DEPENDS%
+libfoo.so=1-64
+bar>=2.0
+tool
+
+%PROVIDES%
+app-api=1
+
+%OPTDEPENDS%
+extra: optional features

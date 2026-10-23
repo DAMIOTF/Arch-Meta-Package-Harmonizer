@@ -1,0 +1,11 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Recording amph package history
+When = PostTransaction
+Exec = /usr/bin/amph history --record-hook

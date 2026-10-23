@@ -1,0 +1,17 @@
+%NAME%
+bar
+
+%VERSION%
+2.1-1
+
+%DESC%
+Fixture library with a versioned capability
+
+%SIZE%
+200
+
+%REASON%
+0
+
+%PROVIDES%
+bar-api=2

@@ -1,9 +1,9 @@
 [package]
 name = "arch-meta-package-harmonizer"
-version = "1.13.1"
+version = "0.2.0-beta"
 edition = "2024"
 authors = ["DAMIOTF dmtf.ovh"]
-description = "A CLI diagnostic tool for analyzing Arch Linux installed packages and system health"
+description = "A CLI and TUI package harmonizer for Arch Linux"
 license = "MIT"
 
 [[bin]]
@@ -12,13 +12,18 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-colored = "2"
-tabled = "0.15"
 comfy-table = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-indicatif = "0.18"
+rayon = "1"
+flate2 = "1"
+zstd = "0.13"
+thiserror = "2"
+nucleo-matcher = "0.3"
+tui-tree-widget = "0.24.1"
+ratatui = { version = "0.30", default-features = false, features = ["all-widgets", "crossterm_0_29", "layout-cache", "macros", "underline-color"] }
+crossterm = "0.29"
 
 [profile.release]
 opt-level = 3
@@ -26,5 +31,3 @@ lto = true
 strip = true
 codegen-units = 1
 panic = "abort"
-
-

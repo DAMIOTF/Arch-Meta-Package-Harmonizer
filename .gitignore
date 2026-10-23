@@ -1,0 +1,5 @@
+/target/
+/dist/
+*.pkg.tar.zst
+*.swp
+.DS_Store

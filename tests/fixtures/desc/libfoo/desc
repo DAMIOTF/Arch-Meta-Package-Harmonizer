@@ -1,0 +1,17 @@
+%NAME%
+libfoo
+
+%VERSION%
+1.2-1
+
+%DESC%
+Fixture library providing a soname
+
+%SIZE%
+300
+
+%REASON%
+0
+
+%PROVIDES%
+libfoo.so=1-64

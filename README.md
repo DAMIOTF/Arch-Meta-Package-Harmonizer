@@ -1,73 +1,92 @@
-# amph - Arch Meta Package Harmonizer
+# amph — Arch Meta Package Harmonizer
 
-`amph` is a terminal assistant for Arch Linux and Arch-based systems. It inspects installed packages, highlights missing dependencies, estimates cleanup opportunities, analyzes disk usage, and produces compact reports that are easier to act on than raw `pacman` output.
+**v0.2-beta · Arch Linux only**
 
-## What it does
+`amph` helps you understand, maintain and reproduce an Arch package set. It reads pacman's local database directly, resolves dependencies through package `Provides`, and offers a keyboard-driven TUI plus a JSON-friendly CLI. It does not run one `pacman -Qi` process per package.
 
-- `scan` for a fast health snapshot with package counts, orphan detection, cache size, and missing dependency links.
-- `analyze` for a deeper dependency review with health and bloat scoring.
-- `report` for a long-form diagnostic report.
-- `clean` for safe cleanup candidates and a copy-paste dry-run command.
-- `stats` for package size distribution and top offenders.
-- `full-scan` for a combined dashboard that pulls the main views together.
-- `history` for previous saved scans.
+## Highlights
+
+- **Explore:** package inventory, dependency paths, removal impact and foreign-package detection.
+- **Harmonize:** find overlapping tools and get alternatives across package categories.
+- **Maintain:** inspect system checks, review pacman history, and preview protected cleanup candidates before confirmation.
+- **Reproduce:** export, compare and safely plan declarative TOML blueprints.
+- **Automate:** use `--json` output and `amph check` in scripts or cron.
+
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center"><strong>Dashboard</strong><br><img src="img/dashboard.png" alt="amph dashboard" width="480"></td>
+    <td align="center"><strong>Packages</strong><br><img src="img/packages.png" alt="Package inventory" width="480"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Dependency graph</strong><br><img src="img/graph.png" alt="Dependency graph" width="480"></td>
+    <td align="center"><strong>Cleanup</strong><br><img src="img/cleanup.png" alt="Cleanup preview" width="480"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Harmony</strong><br><img src="img/harmony.png" alt="Harmony categories and suggestions" width="480"></td>
+    <td align="center"><strong>Checks</strong><br><img src="img/checks.png" alt="System checks" width="480"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Timeline</strong><br><img src="img/timeline.png" alt="Pacman transaction timeline" width="480"></td>
+    <td align="center"><strong>Tokyo Night</strong><br><img src="img/theme_tokyo.png" alt="Tokyo Night theme" width="480"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Gruvbox</strong><br><img src="img/theme_gruvbox.png" alt="Gruvbox theme" width="480"></td>
+    <td align="center"><strong>Nord</strong><br><img src="img/theme_nord.png" alt="Nord theme" width="480"></td>
+  </tr>
+</table>
 
 ## Install
 
-### One-line installer
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/install.sh | bash
-```
-
-This builds the project, installs the binary as `amph`, and places it in a standard binary directory so the command is available immediately.
-
-### From source
-
-```bash
+```sh
 cargo build --release --locked
+install -Dm755 target/release/amph "$HOME/.cargo/bin/amph"
+hash -r
+amph --version
 ```
 
-### Arch package build
+This user-local install takes precedence over `/usr/local/bin` on the standard Arch `PATH`. For a system-wide install, replace `/usr/local/bin/amph` with the built binary using `sudo install -Dm755 target/release/amph /usr/local/bin/amph`. Or build the Arch package with `makepkg -si`.
 
-```bash
-makepkg -si
+## Use
+
+```sh
+amph                                  # open the TUI
+amph why firefox --json
+amph impact firefox chromium --json
+amph harmony
+amph blueprint export > workstation.toml
+amph blueprint diff workstation.toml
+amph blueprint apply workstation.toml # plan only; --execute is explicit
+amph check --json                     # cron-friendly: 0 healthy, 1 warning, 2 critical
+amph timeline --since 7d
+amph cleanup                          # preview only
 ```
 
-## Usage
+Cleanup previews pacman's proposed removal set and requires confirmation to execute. Protected packages (including `base`, `linux` and `pacman`), theme, check thresholds and history retention are configurable in `~/.config/amph/config.toml`:
 
-```bash
-amph scan
-amph analyze
-amph report
-amph clean
-amph stats
-amph full-scan
-amph history
+```toml
+protected = ["linux", "pacman", "my-critical-package"]
+
+[theme]
+palette = "nord" # catppuccin, tokyo-night, gruvbox, nord
+
+[thresholds]
+sync_db_max_age_days = 30
+cache_old_days = 30
+max_history = 100
 ```
 
-## Export examples
+User Harmony categories live in `~/.config/amph/harmony.toml`.
 
-```bash
-amph scan --json report.json --markdown report.md
-amph analyze --json analysis.json --markdown analysis.md
-amph report --json full-report.json --markdown full-report.md
-amph clean --json cleanup.json --markdown cleanup.md
-amph full-scan --json dashboard.json --markdown dashboard.md
+An optional pacman hook template is installed at `/usr/share/amph/hooks/amph-history.hook`; copy it to `/etc/pacman.d/hooks/` to enable compact post-transaction history recording.
+
+## Verify
+
+```sh
+cargo fmt --check
+cargo test --locked
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-## Notes
-
-- `clean` only prints safe cleanup suggestions; it never removes packages automatically.
-- `history` reads the local scan log created by `amph`.
-- `analyze`, `report`, and `full-scan` save scan history after a successful analysis.
-- The tool expects `pacman` to be available, so it is intended for Arch Linux and compatible derivatives.
-
-## Screenshots
-![analyze1](img/analyze1.png)
-![analyze2](img/analyze2.png)
-![clean](img/clean.png)
-![cleanup_suggestion](img/cleanup_suggestion.png)
-![full-scan](img/full-scan.png)
-![loading](img/loading.png)
-![scan](img/scan.png)
+MIT licensed. See [LICENSE](LICENSE).

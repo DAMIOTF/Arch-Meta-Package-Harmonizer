@@ -1,0 +1,17 @@
+%NAME%
+tool
+
+%VERSION%
+1.0-1
+
+%DESC%
+Fixture consumer of bar
+
+%SIZE%
+50
+
+%REASON%
+1
+
+%DEPENDS%
+bar>=2.0
