@@ -13,11 +13,9 @@
 - **Automate:** use `--json` output and `amph check` in scripts or cron.
 
 ## Screenshots
-
-<details>
-<summary>Application views</summary>
-
 ![Dashboard](img/dashboard.png)
+<details>
+<summary>More application views</summary>
 
 ![Packages](img/packages.png)
 
