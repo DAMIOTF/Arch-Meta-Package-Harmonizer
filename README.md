@@ -1,4 +1,6 @@
-# amph: Arch Meta Package Harmonizer
+# AMPH: Arch Meta Package Harmonizer
+<img src="img/amph_logo_full.png" alt="logo" width="50%" />
+
 
 **v0.2-beta · Arch Linux only**
 
@@ -94,6 +96,10 @@ cargo fmt --check
 cargo test --locked
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+
+
+<a href='https://ko-fi.com/I2I21ISAGC' target='_blank'><img height='86' style='border:0px;height:86px;' src='https://storage.ko-fi.com/cdn/kofi3.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
 
 ## License
 
