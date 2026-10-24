@@ -1,9 +1,17 @@
 name: Publish to crates.io
 
-# Manual-only by design. Tag pushes and GitHub Release creation must never
-# publish a crate: this workflow has no push trigger, and the release workflow
-# creates tags with the built-in GITHUB_TOKEN.
+# Publishes a crate exactly once per new Cargo package version on main.
+# Tag pushes and GitHub Release creation must never publish a crate: this
+# workflow has no tag trigger, and the release workflow creates tags with the
+# built-in GITHUB_TOKEN (whose events do not start new workflow runs).
+#
+# workflow_dispatch remains available for a one-time release or a retry.
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.toml
   workflow_dispatch:
     inputs:
       version:
@@ -32,52 +40,105 @@ jobs:
       - name: Check out release ref
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.git_ref }}
-          fetch-depth: 1
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.git_ref || github.sha }}
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Verify requested version matches Cargo.toml
+      - name: Resolve version and decide whether to publish
+        id: resolve
         env:
-          REQUESTED_VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          actual="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
-          if [[ -z "${REQUESTED_VERSION//[[:space:]]/}" ]]; then
-            echo "::error::The version input is required."
-            exit 1
-          fi
-          if [[ "$REQUESTED_VERSION" != "$actual" ]]; then
-            echo "::error::Requested version '${REQUESTED_VERSION}' does not exactly match Cargo.toml version '${actual}'."
-            exit 1
-          fi
-          echo "Verified Cargo.toml version ${actual}."
 
-      - name: Refuse to republish an existing crates.io version
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          status="$(curl -sS -o /dev/null -w '%{http_code}' --retry 2 \
-            "https://crates.io/api/v1/crates/amph/${VERSION}" || true)"
-          if [[ "$status" == "200" ]]; then
-            echo "::error::amph ${VERSION} already exists on crates.io; refusing to publish it again."
+          read_version() {
+            git show "$1:Cargo.toml" | python3 -c \
+              'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])'
+          }
+
+          emit() {
+            printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"
+          }
+
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            target="$HEAD_SHA"
+            version="$(read_version "$target")"
+            previous=""
+            if [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+              echo "No previous main commit is available; treating ${version} as new."
+            elif git cat-file -e "${BEFORE_SHA}:Cargo.toml" 2>/dev/null; then
+              previous="$(read_version "$BEFORE_SHA")"
+            else
+              echo "Previous commit ${BEFORE_SHA} is unavailable; treating ${version} as new."
+            fi
+            if [[ -n "$previous" && "$previous" == "$version" ]]; then
+              echo "Cargo.toml version is still ${version}; no publication is needed."
+              emit publish false
+              exit 0
+            fi
+            echo "Cargo.toml version changed from '${previous:-<none>}' to '${version}'."
+          else
+            if [[ -z "${INPUT_VERSION//[[:space:]]/}" ]]; then
+              echo "::error::The version input is required for workflow_dispatch."
+              exit 1
+            fi
+            version="$INPUT_VERSION"
+            target="$(git rev-parse --verify --end-of-options 'HEAD^{commit}')"
+            manifest_version="$(read_version "$target")"
+            if [[ "$version" != "$manifest_version" ]]; then
+              echo "::error::Requested version '${version}' does not exactly match Cargo.toml version '${manifest_version}'."
+              exit 1
+            fi
+            echo "Dispatching publication of ${version}."
+          fi
+
+          if [[ ! "$version" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]; then
+            echo "::error::Unsafe or unsupported version string: '${version}'."
             exit 1
           fi
-          if [[ "$status" != "404" ]]; then
-            echo "::warning::Could not confirm the crates.io state (HTTP ${status:-unknown}); continuing."
-          else
-            echo "amph ${VERSION} is not published on crates.io yet."
-          fi
+
+          emit publish true
+          emit version "$version"
+
+      - name: Preflight crates.io version check
+        if: steps.resolve.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          user_agent="amph-release/${VERSION} (https://github.com/DAMIOTF/Arch-Meta-Package-Harmonizer)"
+          status="$(curl -sS -o /dev/null -w '%{http_code}' --retry 2 \
+            --user-agent "$user_agent" \
+            "https://crates.io/api/v1/crates/amph/${VERSION}" || true)"
+          case "$status" in
+            404)
+              echo "amph ${VERSION} is not published on crates.io yet."
+              ;;
+            200)
+              echo "::error::amph ${VERSION} already exists on crates.io; refusing to publish an immutable version again."
+              exit 1
+              ;;
+            *)
+              echo "::error::Unexpected crates.io preflight response (HTTP ${status:-unknown}) for amph ${VERSION}; failing closed."
+              exit 1
+              ;;
+          esac
 
       - name: Run tests
+        if: steps.resolve.outputs.publish == 'true'
         run: cargo test --locked
 
       - name: Dry-run publish
+        if: steps.resolve.outputs.publish == 'true'
         run: cargo publish --dry-run --locked
 
       - name: Publish to crates.io
+        if: steps.resolve.outputs.publish == 'true'
         run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

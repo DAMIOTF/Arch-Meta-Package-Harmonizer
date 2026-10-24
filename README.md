@@ -128,9 +128,14 @@ The `workflow_dispatch` inputs can rebuild a release from a ref whose tag alread
 
 ## Publishing to crates.io
 
-Crates.io publication is manual and is never triggered by tags or GitHub Releases. Run `.github/workflows/publish.yml` from the Actions tab (`workflow_dispatch`) with the exact version in `Cargo.toml` and the git ref to publish from (default `main`). The workflow verifies the version match, refuses a version that already exists on crates.io, runs the test suite, performs `cargo publish --dry-run --locked`, and then runs `cargo publish --locked` using the `CARGO_REGISTRY_TOKEN` Actions secret.
+Crates.io publication is automatic when a new Cargo package version reaches `main`, and is never triggered by tags or GitHub Releases.
 
-`0.2.0-beta` is already published on crates.io, so do not dispatch a publish for it. `0.3.0-beta` is in `Cargo.toml` but has not been published.
+- A push to `main` that changes `Cargo.toml` compares the package version with the previous `main` commit. If the version is unchanged, the workflow does nothing. If it is new, the workflow publishes it.
+- `workflow_dispatch` remains available for a one-time release or a retry. It requires the exact version in `Cargo.toml` at the selected git ref (default `main`).
+- Before publishing, the workflow queries the crates.io API. A version that already exists (HTTP 200) aborts the run; only the expected HTTP 404 allows it to continue. Any other response also aborts the run.
+- The workflow runs the test suite, performs `cargo publish --dry-run --locked`, and then runs `cargo publish --locked` using the `CARGO_REGISTRY_TOKEN` Actions secret. Runs are serialized so two publications cannot overlap.
+
+`0.2.0-beta` is already published on crates.io, so do not dispatch a publish for it. To publish the version currently declared in `Cargo.toml` without waiting for another version bump, use a one-off manual dispatch with that exact version.
 
 ## Support
 
