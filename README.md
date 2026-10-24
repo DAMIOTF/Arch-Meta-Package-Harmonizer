@@ -15,36 +15,42 @@
 - **Automate:** use `--json` output and `amph check` in scripts or cron.
 
 ## Screenshots
-![Dashboard](img/dashboard.png)
+![Dashboard](https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/dashboard.png)
 <details>
 <summary>More application views</summary>
 
-![Packages](img/packages.png)
+![Packages](https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/packages.png)
 
-![Dependency graph](img/graph.png)
+![Dependency graph](https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/graph.png)
 
-![Cleanup](img/cleanup.png)
+![Cleanup](https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/cleanup.png)
 
-![Harmony](img/harmony.png)
+![Harmony](https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/harmony.png)
 
-![System checks](img/checks.png)
+![System checks](https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/checks.png)
 
-![Pacman timeline](img/timeline.png)
+![Pacman timeline](https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/timeline.png)
 
 </details>
 
 <details>
 <summary>Color themes</summary>
 
-![Tokyo Night](img/theme_tokyo.png)
+![Tokyo Night](https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/theme_tokyo.png)
 
-![Gruvbox](img/theme_gruvbox.png)
+![Gruvbox](https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/theme_gruvbox.png)
 
-![Nord](img/theme_nord.png)
+![Nord](https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/theme_nord.png)
 
 </details>
 
 ## Install
+
+Install the current beta from crates.io with Cargo:
+
+```sh
+cargo install amph --version 0.2.0-beta --locked
+```
 
 The installer builds the current release and installs to `$CARGO_HOME/bin` or `~/.cargo/bin` by default. A user install does not need `sudo`.
 

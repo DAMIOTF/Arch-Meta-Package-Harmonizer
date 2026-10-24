@@ -1,10 +1,16 @@
 [package]
-name = "arch-meta-package-harmonizer"
+name = "amph"
 version = "0.2.0-beta"
 edition = "2024"
 authors = ["DAMIOTF dmtf.ovh"]
 description = "A CLI and TUI package harmonizer for Arch Linux"
 license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/DAMIOTF/Arch-Meta-Package-Harmonizer"
+homepage = "https://amph.dmtf.ovh"
+readme = "README.md"
+keywords = ["arch-linux", "pacman", "tui", "package-manager", "cli"]
+categories = ["command-line-utilities", "config"]
+include = ["Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "src/**", "tests/**"]
 
 [[bin]]
 name = "amph"
