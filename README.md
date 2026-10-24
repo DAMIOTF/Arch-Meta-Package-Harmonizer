@@ -114,9 +114,23 @@ cargo test --locked
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-## Automated publishing
+## GitHub Releases
 
-Pushing a `v*` tag triggers `.github/workflows/publish.yml`. The workflow checks that the tag version matches `Cargo.toml`, runs the test suite, and publishes the crate. For each release, bump the Cargo version, commit the change, then push a tag matching the exact Cargo version, for example `v0.3.0-beta`. The GitHub Actions secret `CARGO_REGISTRY_TOKEN` is required.
+`.github/workflows/release.yml` publishes a GitHub Release for every new Cargo package version that reaches `main`.
+
+- A push to `main` that changes `Cargo.toml` compares the package version with the previous `main` commit. If the version is unchanged, the workflow does nothing. If it is new, the workflow creates the `v<version>` tag at that commit and publishes the release.
+- Release notes are generated with the GitHub Release Notes API (a manual dispatch can supply `release_notes` instead). They are wrapped with version and commit metadata in `CHANGELOG-v<version>.md`, which is used as the release body and attached as an asset.
+- Attached assets are the `git archive` source archives `amph-<version>.tar.gz` and `amph-<version>.zip`, the changelog, and `SHA256SUMS` with SHA-256 checksums for all three files.
+- Versions containing a hyphen, such as `0.2.0-beta` and `0.3.0-beta`, are marked as prereleases.
+- The workflow uses the built-in `GITHUB_TOKEN` with `contents: write` and needs no repository secrets. It refuses to move an existing tag, and reruns update the existing release in place instead of creating a duplicate.
+
+To backfill an older version, run the workflow manually from the Actions tab with the exact `version`, the `target_ref` commit, and optional `release_notes`. For example, backfill `0.2.0-beta` at commit `0766beb` with the notes `0.2.0-beta was previously published on crates.io and is backfilled to GitHub Releases.` The requested version must exactly match `Cargo.toml` at `target_ref`.
+
+## Publishing to crates.io
+
+Crates.io publication is manual and is never triggered by tags or GitHub Releases. Run `.github/workflows/publish.yml` from the Actions tab (`workflow_dispatch`) with the exact version in `Cargo.toml` and the git ref to publish from (default `main`). The workflow verifies the version match, refuses a version that already exists on crates.io, runs the test suite, performs `cargo publish --dry-run --locked`, and then runs `cargo publish --locked` using the `CARGO_REGISTRY_TOKEN` Actions secret.
+
+`0.2.0-beta` is already published on crates.io, so do not dispatch a publish for it. `0.3.0-beta` is in `Cargo.toml` but has not been published.
 
 ## Support
 

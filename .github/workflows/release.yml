@@ -1,0 +1,256 @@
+name: Release
+
+# Creates a GitHub Release for each new Cargo package version that lands on
+# main. Crates.io publication is intentionally NOT part of this workflow.
+#
+# This workflow has no tag-push trigger and only creates tags/releases with the
+# built-in GITHUB_TOKEN. Events created with GITHUB_TOKEN do not start new
+# workflow runs, so creating a release cannot publish a crate.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.toml
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact version from Cargo.toml at target_ref (for example 0.2.0-beta)"
+        required: true
+        type: string
+      target_ref:
+        description: "Git ref (branch, tag, or full SHA) to release; used for historical backfills"
+        required: false
+        default: main
+        type: string
+      release_notes:
+        description: "Optional markdown notes that replace the generated notes"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: github-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version, target commit, and tag state
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_TARGET_REF: ${{ inputs.target_ref }}
+        run: |
+          set -euo pipefail
+
+          read_version() {
+            git show "$1:Cargo.toml" | python3 -c \
+              'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])'
+          }
+
+          emit() {
+            printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"
+          }
+
+          resolve_commit() {
+            local ref="$1"
+            git rev-parse --verify --end-of-options "${ref}^{commit}" 2>/dev/null \
+              || git rev-parse --verify --end-of-options "origin/${ref}^{commit}" 2>/dev/null
+          }
+
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            target="$HEAD_SHA"
+            version="$(read_version "$target")"
+            previous=""
+            if [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+              echo "No previous main commit is available; treating ${version} as new."
+            elif git cat-file -e "${BEFORE_SHA}:Cargo.toml" 2>/dev/null; then
+              previous="$(read_version "$BEFORE_SHA")"
+            else
+              echo "Previous commit ${BEFORE_SHA} is unavailable; treating ${version} as new."
+            fi
+            if [[ -n "$previous" && "$previous" == "$version" ]]; then
+              echo "Cargo.toml version is still ${version}; no release is needed."
+              emit release false
+              exit 0
+            fi
+            echo "Cargo.toml version changed from '${previous:-<none>}' to '${version}'."
+          else
+            if [[ -z "${INPUT_VERSION//[[:space:]]/}" ]]; then
+              echo "::error::The version input is required for workflow_dispatch."
+              exit 1
+            fi
+            version="$INPUT_VERSION"
+            target_ref="${INPUT_TARGET_REF:-main}"
+            if ! target="$(resolve_commit "$target_ref")"; then
+              echo "::error::Cannot resolve target_ref '${target_ref}' to a commit."
+              exit 1
+            fi
+            manifest_version="$(read_version "$target")"
+            if [[ "$version" != "$manifest_version" ]]; then
+              echo "::error::Requested version '${version}' does not exactly match Cargo.toml version '${manifest_version}' at ${target_ref} (${target})."
+              exit 1
+            fi
+            echo "Dispatching release ${version} at ${target_ref} (${target})."
+          fi
+
+          if [[ ! "$version" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]; then
+            echo "::error::Unsafe or unsupported version string: '${version}'."
+            exit 1
+          fi
+
+          target="$(git rev-parse --verify --end-of-options "${target}^{commit}")"
+          tag="v${version}"
+
+          if git show-ref --verify --quiet "refs/tags/${tag}"; then
+            tagged_commit="$(git rev-list -n 1 "refs/tags/${tag}")"
+            if [[ "$tagged_commit" != "$target" ]]; then
+              echo "::error::Tag ${tag} already exists at ${tagged_commit}, but the release target is ${target}. Refusing to move an existing tag."
+              exit 1
+            fi
+            tag_exists=true
+            echo "Tag ${tag} already points to the release target; reusing it."
+          else
+            tag_exists=false
+          fi
+
+          prerelease=false
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+          fi
+
+          emit release true
+          emit version "$version"
+          emit tag "$tag"
+          emit target "$target"
+          emit tag_exists "$tag_exists"
+          emit prerelease "$prerelease"
+
+      - name: Create release tag
+        if: steps.resolve.outputs.release == 'true' && steps.resolve.outputs.tag_exists != 'true'
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+          TARGET: ${{ steps.resolve.outputs.target }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # The GITHUB_TOKEN-created tag does not start new workflow runs.
+          git tag -a "$TAG" "$TARGET" -m "AMPH ${VERSION}"
+          git push origin "refs/tags/${TAG}"
+
+      - name: Generate release notes
+        if: steps.resolve.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          TARGET: ${{ steps.resolve.outputs.target }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${RELEASE_NOTES//[[:space:]]/}" ]]; then
+            printf '%s\n' "$RELEASE_NOTES" > release-notes.md
+            echo "Using dispatch-supplied release notes."
+            exit 0
+          fi
+
+          args=(
+            --method POST
+            "repos/${REPO}/releases/generate-notes"
+            -f "tag_name=${TAG}"
+            -f "target_commitish=${TARGET}"
+          )
+          previous_tag="$(git describe --tags --abbrev=0 "${TARGET}^" 2>/dev/null || true)"
+          if [[ -n "$previous_tag" && "$previous_tag" != "$TAG" ]]; then
+            args+=(-f "previous_tag_name=${previous_tag}")
+          fi
+          gh api "${args[@]}" --jq .body > release-notes.md
+
+      - name: Build source archives, changelog, and checksums
+        if: steps.resolve.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          TARGET: ${{ steps.resolve.outputs.target }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          git archive \
+            --format=tar.gz \
+            --prefix="amph-${VERSION}/" \
+            -o "dist/amph-${VERSION}.tar.gz" \
+            "$TARGET"
+          git archive \
+            --format=zip \
+            --prefix="amph-${VERSION}/" \
+            -o "dist/amph-${VERSION}.zip" \
+            "$TARGET"
+
+          {
+            echo "# AMPH ${TAG}"
+            echo
+            echo "- Version: \`${VERSION}\`"
+            echo "- Commit: [\`$(git rev-parse --short=12 "$TARGET")\`](https://github.com/${REPO}/commit/${TARGET})"
+            echo "- Date: $(git show -s --format=%cI "$TARGET")"
+            echo
+            cat release-notes.md
+          } > "dist/CHANGELOG-${TAG}.md"
+
+          (
+            cd dist
+            sha256sum \
+              "amph-${VERSION}.tar.gz" \
+              "amph-${VERSION}.zip" \
+              "CHANGELOG-${TAG}.md" > SHA256SUMS
+          )
+
+          ls -l dist
+
+      - name: Create or update GitHub release
+        if: steps.resolve.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          PRERELEASE: ${{ steps.resolve.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          title="AMPH ${TAG}"
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; updating it in place."
+            # The release body is the generated changelog file, which is also
+            # attached as an asset.
+            edit_args=(--title "$title" --notes-file "dist/CHANGELOG-${TAG}.md")
+            if [[ "$PRERELEASE" == "true" ]]; then
+              edit_args+=(--prerelease)
+            else
+              edit_args+=(--prerelease=false)
+            fi
+            gh release edit "$TAG" --repo "$REPO" "${edit_args[@]}"
+            gh release upload "$TAG" --repo "$REPO" --clobber dist/*
+          else
+            create_args=(--verify-tag --title "$title" --notes-file "dist/CHANGELOG-${TAG}.md")
+            if [[ "$PRERELEASE" == "true" ]]; then
+              create_args+=(--prerelease)
+            fi
+            gh release create "$TAG" --repo "$REPO" "${create_args[@]}" dist/*
+          fi

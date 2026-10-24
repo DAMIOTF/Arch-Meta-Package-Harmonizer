@@ -1,34 +1,81 @@
-name: Publish to Cargo
+name: Publish to crates.io
 
+# Manual-only by design. Tag pushes and GitHub Release creation must never
+# publish a crate: this workflow has no push trigger, and the release workflow
+# creates tags with the built-in GITHUB_TOKEN.
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact Cargo package version to publish (for example 0.3.0-beta)"
+        required: true
+        type: string
+      git_ref:
+        description: "Git ref to publish from"
+        required: false
+        default: main
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: crates-io-publish
+  cancel-in-progress: false
+
 jobs:
   publish:
+    name: Publish amph to crates.io
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out release ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+          fetch-depth: 1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Verify tag matches crate version
-        shell: bash
+      - name: Verify requested version matches Cargo.toml
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
-          version="$(cargo metadata --no-deps --format-version 1 | python -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
-          tag_version="${GITHUB_REF_NAME#v}"
-          if [[ "$tag_version" != "$version" ]]; then
-            echo "Tag v${tag_version} does not match Cargo.toml version ${version}." >&2
+          set -euo pipefail
+          actual="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          if [[ -z "${REQUESTED_VERSION//[[:space:]]/}" ]]; then
+            echo "::error::The version input is required."
             exit 1
+          fi
+          if [[ "$REQUESTED_VERSION" != "$actual" ]]; then
+            echo "::error::Requested version '${REQUESTED_VERSION}' does not exactly match Cargo.toml version '${actual}'."
+            exit 1
+          fi
+          echo "Verified Cargo.toml version ${actual}."
+
+      - name: Refuse to republish an existing crates.io version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          status="$(curl -sS -o /dev/null -w '%{http_code}' --retry 2 \
+            "https://crates.io/api/v1/crates/amph/${VERSION}" || true)"
+          if [[ "$status" == "200" ]]; then
+            echo "::error::amph ${VERSION} already exists on crates.io; refusing to publish it again."
+            exit 1
+          fi
+          if [[ "$status" != "404" ]]; then
+            echo "::warning::Could not confirm the crates.io state (HTTP ${status:-unknown}); continuing."
+          else
+            echo "amph ${VERSION} is not published on crates.io yet."
           fi
 
       - name: Run tests
         run: cargo test --locked
+
+      - name: Dry-run publish
+        run: cargo publish --dry-run --locked
 
       - name: Publish to crates.io
         run: cargo publish --locked
