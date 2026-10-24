@@ -135,7 +135,7 @@ Crates.io publication is automatic when a new Cargo package version reaches `mai
 - Before publishing, the workflow queries the crates.io API. A version that already exists (HTTP 200) aborts the run; only the expected HTTP 404 allows it to continue. Any other response also aborts the run.
 - The workflow runs the test suite, performs `cargo publish --dry-run --locked`, and then runs `cargo publish --locked` using the `CARGO_REGISTRY_TOKEN` Actions secret. Runs are serialized so two publications cannot overlap.
 
-`0.2.0-beta` is already published on crates.io, so do not dispatch a publish for it. To publish the version currently declared in `Cargo.toml` without waiting for another version bump, use a one-off manual dispatch with that exact version.
+`0.2.0-beta` and `0.3.0-beta` are published on crates.io. Do not dispatch a publish for either existing version. To publish a new version manually before it reaches `main`, use a one-off dispatch with that exact version; never republish an existing version.
 
 ## Support
 
