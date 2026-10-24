@@ -11,6 +11,7 @@ pub mod model;
 pub mod source;
 pub mod store;
 pub mod tui;
+pub mod update;
 
 use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Write};
@@ -34,7 +35,7 @@ use store::HistoryEntry;
 #[derive(Parser)]
 #[command(
     name = "amph",
-    version = "v0.2-beta",
+    version = "v0.3.0-beta",
     about = "Arch Meta Package Harmonizer",
     long_about = "Inspect installed Arch Linux packages, trace dependency paths, preview safe removals, check system health, export blueprints and browse a terminal dashboard."
 )]
@@ -111,6 +112,13 @@ enum Commands {
     #[command(hide = true)]
     RecordHistory,
 
+    /// Check GitHub `main` for a newer version and install it with Cargo.
+    Update {
+        /// Install without asking for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+
     /// Preview orphan removal, confirm and optionally execute `sudo pacman -Rns`.
     Cleanup {
         /// Execute after the preview. Without this flag cleanup is a dry run.
@@ -186,7 +194,10 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<u8> {
-    match cli.command {
+    let notify_update = !cli.json
+        && cli.command.is_some()
+        && !matches!(&cli.command, Some(Commands::Update { .. }));
+    let code = match cli.command {
         None => {
             if cli.json {
                 return Err(anyhow!("--json requires a subcommand"));
@@ -207,10 +218,16 @@ fn run(cli: Cli) -> Result<u8> {
             command_history(limit, record_hook, cli.json)
         }
         Some(Commands::RecordHistory) => command_record_history(cli.json),
+        Some(Commands::Update { yes }) => command_update(yes, cli.json),
         Some(Commands::Cleanup { execute, yes, keep }) => {
             command_cleanup(execute, yes, &keep, cli.json)
         }
+    }?;
+
+    if notify_update {
+        update::notify_if_update_available();
     }
+    Ok(code)
 }
 
 // ---------------------------------------------------------------------------
@@ -1176,6 +1193,103 @@ fn print_check_details(report: &ChecksReport) {
 }
 
 // ---------------------------------------------------------------------------
+// update
+// ---------------------------------------------------------------------------
+
+fn command_update(yes: bool, json: bool) -> Result<u8> {
+    let Some(available) = update::check_for_update()? else {
+        if json {
+            print_json(&json!({
+                "kind": "update",
+                "current": update::current_version(),
+                "update_available": false,
+                "installed": false,
+                "branch": update::BRANCH,
+                "repository": update::REPOSITORY,
+            }))?;
+        } else {
+            println!(
+                "amph v{} is up to date (GitHub branch {}).",
+                update::current_version(),
+                update::BRANCH
+            );
+        }
+        return Ok(0);
+    };
+
+    if json && !yes {
+        // `--json` is non-interactive: report the available update without
+        // prompting or installing. Add --yes to install from a script.
+        print_json(&json!({
+            "kind": "update",
+            "current": available.current,
+            "latest": available.latest,
+            "update_available": true,
+            "installed": false,
+            "branch": available.branch,
+            "repository": available.repository,
+        }))?;
+        return Ok(0);
+    }
+
+    if !json {
+        println!(
+            "Update available: amph v{} -> v{} (GitHub branch {}).",
+            available.current, available.latest, available.branch
+        );
+        println!(
+            "This runs `cargo install --git {} --branch {} --locked --force`.",
+            available.repository, available.branch
+        );
+        match confirm("Install this update now?", yes, false) {
+            Ok(()) => {}
+            Err(error) if error.to_string() == "cancelled" => {
+                println!("Update cancelled.");
+                return Ok(0);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if json {
+        return match update::install_update() {
+            Ok(()) => {
+                print_json(&json!({
+                    "kind": "update",
+                    "current": available.current,
+                    "latest": available.latest,
+                    "update_available": true,
+                    "installed": true,
+                    "branch": available.branch,
+                    "repository": available.repository,
+                }))?;
+                Ok(0)
+            }
+            Err(error) => {
+                print_json(&json!({
+                    "kind": "update",
+                    "current": available.current,
+                    "latest": available.latest,
+                    "update_available": true,
+                    "installed": false,
+                    "branch": available.branch,
+                    "repository": available.repository,
+                    "error": format!("{error:#}"),
+                }))?;
+                Ok(1)
+            }
+        };
+    }
+
+    update::install_update()?;
+    println!(
+        "amph v{} installed. Restart any running amph sessions to use it.",
+        available.latest
+    );
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
 // timeline
 // ---------------------------------------------------------------------------
 
@@ -1703,7 +1817,14 @@ fn run_tui() -> Result<()> {
     };
 
     let cleanup = tui_cleanup_handler(&config);
-    tui::run_with_theme(tui_scan, theme, cleanup)
+    let installer = |_request: tui::UpdateRequest| match update::install_update() {
+        Ok(()) => Ok(tui::UpdateOutcome::new(
+            true,
+            "Update installed. Restart AMPH to load the new version.",
+        )),
+        Err(error) => Err(tui::UpdateError::new(format!("{error:#}"))),
+    };
+    tui::run_with_theme_and_update(tui_scan, theme, cleanup, installer)
 }
 
 fn theme_kind_from_palette(value: &str) -> Option<tui::ThemeKind> {
@@ -1717,6 +1838,16 @@ fn theme_kind_from_palette(value: &str) -> Option<tui::ThemeKind> {
 }
 
 fn tui_scan(tx: std::sync::mpsc::Sender<tui::ScanMessage>) {
+    let update_tx = tx.clone();
+    std::thread::spawn(move || {
+        if let Ok(Some(found)) = update::check_for_update() {
+            let info = tui::UpdateInfo::new(found.current, found.latest)
+                .with_url(update::REPOSITORY)
+                .with_notes("Newer build available on GitHub main.");
+            let _ = update_tx.send(tui::ScanMessage::update_available(info));
+        }
+    });
+
     let progress_tx = tx.clone();
     let progress = source::Progress::new(move |event| {
         let stage = match event.phase {
@@ -1962,6 +2093,15 @@ mod tests {
         let cli = Cli::try_parse_from(["amph", "why", "bash", "--json"]).expect("json flag");
         assert!(cli.json);
         assert!(Cli::try_parse_from(["amph", "--json=1", "why", "bash"]).is_err());
+    }
+
+    #[test]
+    fn update_command_parses_with_yes_flag() {
+        let cli = Cli::try_parse_from(["amph", "update", "--yes"]).expect("update command");
+        assert!(matches!(cli.command, Some(Commands::Update { yes: true })));
+
+        let cli = Cli::try_parse_from(["amph", "update"]).expect("update command");
+        assert!(matches!(cli.command, Some(Commands::Update { yes: false })));
     }
 
     #[test]

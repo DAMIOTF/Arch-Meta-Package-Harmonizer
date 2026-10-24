@@ -53,6 +53,54 @@
 //! `pacman -Rns --print -- <names>` for preview and
 //! `sudo pacman -Rns -- <names>` for removal, with `LC_ALL=C`, and return the
 //! captured text plus status.
+//!
+//! # Update notifications
+//!
+//! The host checks GitHub `main` in the background on startup. When a newer
+//! version exists it sends [`ScanMessage::UpdateAvailable`] with an
+//! [`UpdateInfo`]. The interface then shows a one-line banner on every tab and
+//! a `u` action; it never opens a modal on its own and never interrupts a scan,
+//! filter, or cleanup flow.
+//!
+//! Installing uses an injected [`UpdateHandler`] via
+//! [`run_with_theme_and_update`]. The flow is:
+//!
+//! 1. The user presses `u` and reviews current/latest versions.
+//! 2. `Enter` queues [`UpdateRequest::Install`]; the TUI suspends the terminal
+//!    and calls the host handler on the main thread.
+//! 3. The handler installs the version by its own method and returns
+//!    [`UpdateOutcome`].
+//! 4. The TUI shows the output and states clearly that AMPH must be restarted
+//!    to load the new version. A persistent `RESTART AMPH` banner remains until
+//!    the session ends.
+//!
+//! The TUI performs no network request and runs no installer itself. Hosts that
+//! do not attach an update handler may still send [`ScanMessage::UpdateAvailable`];
+//! the banner appears but the install action stays disabled.
+//!
+//! ```ignore
+//! // Give the update check its own thread so the package scan never waits.
+//! let update_tx = tx.clone();
+//! std::thread::spawn(move || {
+//!     // Only send when the remote is actually newer (`check_for_update` filters).
+//!     if let Ok(Some(found)) = update::check_for_update() {
+//!         let info = tui::UpdateInfo::new(found.current, found.latest)
+//!             .with_url(update::REPOSITORY);
+//!         let _ = update_tx.send(tui::ScanMessage::update_available(info));
+//!     }
+//! });
+//!
+//! // Host installer, called with the terminal suspended.
+//! let installer = |request: tui::UpdateRequest| match update::install_update() {
+//!     Ok(()) => Ok(tui::UpdateOutcome::new(
+//!         true,
+//!         format!("amph {} installed", request.version()),
+//!     )),
+//!     Err(error) => Err(tui::UpdateError::new(format!("{error:#}"))),
+//! };
+//!
+//! tui::run_with_theme_and_update(tui_scan, theme, cleanup, installer)
+//! ```
 
 mod app;
 pub mod cleanup;
@@ -62,6 +110,7 @@ mod fuzzy;
 mod metrics;
 pub mod model;
 pub mod theme;
+pub mod update;
 pub mod views;
 pub mod widgets;
 
@@ -88,6 +137,10 @@ pub use cleanup::{
 pub use event::{InputEvent, ScanMessage};
 pub use model::{Package, Snapshot, TimelineItem, TimelineKind};
 pub use theme::{Theme, ThemeKind};
+pub use update::{
+    ReadOnlyUpdateHandler, UpdateError, UpdateHandler, UpdateHandlerResult, UpdateInfo,
+    UpdateOutcome, UpdateRequest,
+};
 
 /// How long the interface waits for a terminal event before redrawing.
 const POLL_INTERVAL: Duration = Duration::from_millis(33);
@@ -97,7 +150,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(33);
 /// This wrapper attaches a handler that can never remove packages. Use
 /// [`run_with_cleanup`] when the host has a real cleanup implementation.
 pub fn run(scan: impl FnOnce(Sender<ScanMessage>) + Send + 'static) -> Result<()> {
-    run_internal(scan, ReadOnlyCleanupHandler, false, None)
+    run_internal(
+        scan,
+        ReadOnlyCleanupHandler,
+        false,
+        ReadOnlyUpdateHandler,
+        false,
+        None,
+    )
 }
 
 /// Launch the dashboard with a real, explicit cleanup handler.
@@ -112,7 +172,7 @@ pub fn run_with_cleanup<H>(
 where
     H: CleanupHandler,
 {
-    run_internal(scan, handler, true, None)
+    run_internal(scan, handler, true, ReadOnlyUpdateHandler, false, None)
 }
 
 /// Launch with an explicit initial palette and cleanup handler.
@@ -128,7 +188,14 @@ pub fn run_with_theme<H>(
 where
     H: CleanupHandler,
 {
-    run_internal(scan, handler, true, Some(theme))
+    run_internal(
+        scan,
+        handler,
+        true,
+        ReadOnlyUpdateHandler,
+        false,
+        Some(theme),
+    )
 }
 
 /// Read-only launch with an explicit initial palette.
@@ -136,7 +203,67 @@ pub fn run_read_only_with_theme(
     scan: impl FnOnce(Sender<ScanMessage>) + Send + 'static,
     theme: ThemeKind,
 ) -> Result<()> {
-    run_internal(scan, ReadOnlyCleanupHandler, false, Some(theme))
+    run_internal(
+        scan,
+        ReadOnlyCleanupHandler,
+        false,
+        ReadOnlyUpdateHandler,
+        false,
+        Some(theme),
+    )
+}
+
+/// Read-only launch with an update handler and the default palette.
+///
+/// `update` is called on the main thread with the terminal suspended when the
+/// user installs an announced update. Read [`update`] for the callback
+/// contract.
+pub fn run_with_update<U>(
+    scan: impl FnOnce(Sender<ScanMessage>) + Send + 'static,
+    update: U,
+) -> Result<()>
+where
+    U: UpdateHandler,
+{
+    run_internal(scan, ReadOnlyCleanupHandler, false, update, true, None)
+}
+
+/// Read-only launch with an explicit palette and an update handler.
+pub fn run_read_only_with_theme_and_update<U>(
+    scan: impl FnOnce(Sender<ScanMessage>) + Send + 'static,
+    theme: ThemeKind,
+    update: U,
+) -> Result<()>
+where
+    U: UpdateHandler,
+{
+    run_internal(
+        scan,
+        ReadOnlyCleanupHandler,
+        false,
+        update,
+        true,
+        Some(theme),
+    )
+}
+
+/// Launch with a palette, a cleanup handler, and an update handler.
+///
+/// This is the full CLI/main integration point: `theme` comes from
+/// `Config::theme`, `cleanup` performs the preview-first removal flow, and
+/// `update` installs a version announced by [`ScanMessage::UpdateAvailable`].
+/// Both handlers run with the terminal suspended. Neither runs in the TUI.
+pub fn run_with_theme_and_update<C, U>(
+    scan: impl FnOnce(Sender<ScanMessage>) + Send + 'static,
+    theme: ThemeKind,
+    cleanup: C,
+    update: U,
+) -> Result<()>
+where
+    C: CleanupHandler,
+    U: UpdateHandler,
+{
+    run_internal(scan, cleanup, true, update, true, Some(theme))
 }
 
 /// Run a self-contained preview with a scripted sample scan.
@@ -171,14 +298,17 @@ pub fn run_demo() -> Result<()> {
     })
 }
 
-fn run_internal<H>(
+fn run_internal<C, U>(
     scan: impl FnOnce(Sender<ScanMessage>) + Send + 'static,
-    mut handler: H,
+    mut cleanup_handler: C,
     cleanup_enabled: bool,
+    mut update_handler: U,
+    update_enabled: bool,
     theme: Option<ThemeKind>,
 ) -> Result<()>
 where
-    H: CleanupHandler,
+    C: CleanupHandler,
+    U: UpdateHandler,
 {
     install_panic_hook();
 
@@ -188,6 +318,7 @@ where
         None => App::new(),
     };
     app.set_cleanup_enabled(cleanup_enabled);
+    app.set_update_enabled(update_enabled);
 
     let (scan_tx, scan_rx) = mpsc::channel::<ScanMessage>();
     let worker = thread::Builder::new()
@@ -211,8 +342,13 @@ where
         drain_scan(&scan_rx, &mut app);
 
         while let Some(request) = app.take_cleanup_request() {
-            let result = run_cleanup_handler(&mut session, &mut handler, request.clone())?;
+            let result = run_cleanup_handler(&mut session, &mut cleanup_handler, request.clone())?;
             app.on_cleanup_handler_result(&request, result);
+        }
+
+        while let Some(request) = app.take_update_request() {
+            let result = run_update_handler(&mut session, &mut update_handler, request.clone())?;
+            app.on_update_handler_result(&request, result);
         }
 
         if app.take_clear_request() {
@@ -252,6 +388,32 @@ where
             Ok(result) => result,
             Err(_) => Err(CleanupError::new(
                 "Cleanup handler panicked; no result was applied.",
+            )),
+        }),
+        Err(error) => {
+            restore_terminal();
+            Err(error)
+        }
+    }
+}
+
+fn run_update_handler<U>(
+    session: &mut TerminalSession,
+    handler: &mut U,
+    request: UpdateRequest,
+) -> Result<UpdateHandlerResult>
+where
+    U: UpdateHandler,
+{
+    session.suspend()?;
+    let result = panic::catch_unwind(AssertUnwindSafe(|| handler.handle(request)));
+    let resumed = session.resume();
+
+    match resumed {
+        Ok(()) => Ok(match result {
+            Ok(result) => result,
+            Err(_) => Err(UpdateError::new(
+                "Update handler panicked; no result was applied. The installed version is unchanged.",
             )),
         }),
         Err(error) => {

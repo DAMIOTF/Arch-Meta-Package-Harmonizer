@@ -2,7 +2,7 @@
 <img src="https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/amph_logo_full.png" alt="AMPH logo" width="50%" />
 
 
-**v0.2-beta · Arch Linux only**
+**v0.3.0-beta · Arch Linux only**
 
 `amph` helps you understand, maintain and reproduce an Arch package set. It reads pacman's local database directly, resolves dependencies through package `Provides`, and offers a keyboard-driven TUI plus a JSON-friendly CLI. It does not run one `pacman -Qi` process per package.
 
@@ -48,10 +48,10 @@
 
 ## Install
 
-Install the current beta from crates.io with Cargo:
+Install the current beta from crates.io with Cargo after `0.3.0-beta` is published:
 
 ```sh
-cargo install amph --version 0.2.0-beta --locked
+cargo install amph --version 0.3.0-beta --locked
 ```
 
 The installer builds the current release and installs to `$CARGO_HOME/bin` or `~/.cargo/bin` by default. A user install does not need `sudo`.
@@ -77,7 +77,10 @@ amph blueprint apply workstation.toml # plan only; --execute is explicit
 amph check --json                     # cron-friendly: 0 healthy, 1 warning, 2 critical
 amph timeline --since 7d
 amph cleanup                          # preview only
+amph update                           # check GitHub main, install with Cargo
 ```
+
+At TUI startup, AMPH checks GitHub's `main` branch in the background. When a newer version is available, the update banner appears without interrupting the dashboard; press `u`, then click **Install** or press Enter. After installation, quit and restart AMPH to load the new binary. In human CLI sessions, AMPH prints an update notice to stderr (cached for up to 24 hours); run `amph update` and confirm to install. `amph update --yes` skips confirmation, while `amph update --json` reports availability without installing. The update is built from GitHub `main` with `cargo install --git ... --branch main --locked --force` into the current Cargo root. AMPH never invokes `sudo` for updates. JSON output from other commands is not modified. Set `AMPH_NO_UPDATE_CHECK=1` to disable the CLI notice.
 
 <img src="https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/2.jpg" alt="dashboard" width="75%" />
 
@@ -109,7 +112,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ## Automated publishing
 
-Pushing a `v*` tag triggers `.github/workflows/publish.yml`. The workflow checks that the tag version matches `Cargo.toml`, runs the test suite, and publishes the crate. For each release, bump the Cargo version, commit the change, then push a matching tag, for example `v0.2.1`. The GitHub Actions secret `CARGO_REGISTRY_TOKEN` is required.
+Pushing a `v*` tag triggers `.github/workflows/publish.yml`. The workflow checks that the tag version matches `Cargo.toml`, runs the test suite, and publishes the crate. For each release, bump the Cargo version, commit the change, then push a tag matching the exact Cargo version, for example `v0.3.0-beta`. The GitHub Actions secret `CARGO_REGISTRY_TOKEN` is required.
 
 ## Support
 

@@ -10,7 +10,7 @@ use crate::tui::app::{
 use crate::tui::theme::Theme;
 use crate::tui::widgets;
 
-pub fn render(frame: &mut Frame, app: &App, screen: Rect) {
+pub fn render(frame: &mut Frame, app: &mut App, screen: Rect) {
     if matches!(app.overlay(), Overlay::None)
         && let Some(toast) = app.active_toast()
     {
@@ -28,6 +28,13 @@ pub fn render(frame: &mut Frame, app: &App, screen: Rect) {
         );
     }
 
+    // The prompt records its Install click target while drawing, so it needs a
+    // mutable app; the other overlays stay read-only.
+    if matches!(app.overlay(), Overlay::UpdatePrompt) {
+        crate::tui::views::update::render_prompt(frame, screen, app);
+        return;
+    }
+
     match app.overlay() {
         Overlay::None => {}
         Overlay::Help => render_help(frame, screen, app),
@@ -36,6 +43,11 @@ pub fn render(frame: &mut Frame, app: &App, screen: Rect) {
         Overlay::CleanupPreview(state) => render_cleanup_preview(frame, screen, app, state),
         Overlay::CleanupResult(state) => render_cleanup_result(frame, screen, app, state),
         Overlay::CleanupError(state) => render_cleanup_error(frame, screen, app, state),
+        Overlay::UpdatePrompt => {}
+        Overlay::UpdateBusy => crate::tui::views::update::render_busy(frame, screen, app),
+        Overlay::UpdateResult(state) => {
+            crate::tui::views::update::render_result(frame, screen, app, state);
+        }
     }
 }
 
@@ -98,6 +110,7 @@ fn render_help(frame: &mut Frame, screen: Rect, app: &App) {
             key_line("space", "pick a cleanup candidate", theme),
             key_line("p", "preview cleanup", theme),
             key_line("i", "inspect panel", theme),
+            key_line("u", "update AMPH", theme),
             key_line("t", "cycle theme", theme),
             key_line("q", "quit", theme),
             Line::from(""),
@@ -131,6 +144,7 @@ fn render_help(frame: &mut Frame, screen: Rect, app: &App) {
         key_line("esc", "clear filter / close", theme),
         help_heading("INTERFACE", theme),
         key_line("i", "toggle inspect panel", theme),
+        key_line("u", "review / install update", theme),
         key_line("t / T", "next / previous theme", theme),
         key_line("q", "quit", theme),
     ];
@@ -151,6 +165,12 @@ fn render_help(frame: &mut Frame, screen: Rect, app: &App) {
         )),
         Line::from(Span::styled(
             "Removal may ask for sudo.",
+            Style::default().fg(theme.warning),
+        )),
+        help_heading("UPDATE", theme),
+        key_line("u", "review / install", theme),
+        Line::from(Span::styled(
+            "Restart AMPH after installing.",
             Style::default().fg(theme.warning),
         )),
         help_heading("THEMES", theme),
@@ -304,7 +324,14 @@ fn render_cleanup_preview(frame: &mut Frame, screen: Rect, app: &App, state: &Cl
         },
     );
 
-    render_output_block(frame, rows[1], &state.output, state.scroll, theme);
+    render_output_block(
+        frame,
+        rows[1],
+        &state.output,
+        state.scroll,
+        theme,
+        "Handler output",
+    );
 
     if state.can_remove {
         let typed_color = if state.typed == "remove" {
@@ -452,7 +479,14 @@ fn render_cleanup_result(frame: &mut Frame, screen: Rect, app: &App, state: &Cle
         },
     );
 
-    render_output_block(frame, rows[1], &state.output, state.scroll, theme);
+    render_output_block(
+        frame,
+        rows[1],
+        &state.output,
+        state.scroll,
+        theme,
+        "Handler output",
+    );
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -501,11 +535,18 @@ fn render_cleanup_error(frame: &mut Frame, screen: Rect, app: &App, state: &Clea
     );
 }
 
-fn render_output_block(frame: &mut Frame, area: Rect, output: &str, scroll: u16, theme: &Theme) {
+pub(super) fn render_output_block(
+    frame: &mut Frame,
+    area: Rect,
+    output: &str,
+    scroll: u16,
+    theme: &Theme,
+    title: &str,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let block = widgets::panel("Handler output", theme);
+    let block = widgets::panel(title, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {

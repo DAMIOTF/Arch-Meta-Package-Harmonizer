@@ -4,12 +4,17 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyEvent, MouseEvent};
 
 use super::model::Snapshot;
+use super::update::UpdateInfo;
 
 /// Messages sent from the scanner thread to the interface.
 ///
 /// A scanner does not have to send every variant. The useful minimum is a
 /// sequence of [`ScanMessage::Progress`] updates followed by one
 /// [`ScanMessage::Snapshot`] and [`ScanMessage::Finished`].
+///
+/// [`ScanMessage::UpdateAvailable`] is independent of the scan lifecycle: a
+/// host may send it before, during, or after the snapshot, and may never send
+/// it when no background update check is configured.
 #[derive(Debug, Clone)]
 pub enum ScanMessage {
     Progress {
@@ -19,6 +24,9 @@ pub enum ScanMessage {
         detail: String,
     },
     Snapshot(Snapshot),
+    /// A background check found a newer version. The host has already compared
+    /// versions; the TUI only presents the result.
+    UpdateAvailable(UpdateInfo),
     Warning(String),
     Failed(String),
     Finished,
@@ -45,6 +53,10 @@ impl ScanMessage {
 
     pub fn snapshot(snapshot: Snapshot) -> Self {
         Self::Snapshot(snapshot)
+    }
+
+    pub fn update_available(info: UpdateInfo) -> Self {
+        Self::UpdateAvailable(info)
     }
 
     pub fn warning(message: impl Into<String>) -> Self {

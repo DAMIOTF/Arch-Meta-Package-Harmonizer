@@ -57,7 +57,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn hints_for(app: &App) -> Vec<(&'static str, &'static str)> {
-    match &app.overlay {
+    let mut hints = match &app.overlay {
         Overlay::Help => vec![("esc", "close"), ("?", "toggle")],
         Overlay::Detail => vec![("esc", "close"), ("i", "toggle panel")],
         Overlay::CleanupBusy => vec![("handler", "running")],
@@ -75,6 +75,25 @@ fn hints_for(app: &App) -> Vec<(&'static str, &'static str)> {
         }
         Overlay::CleanupResult(_) => vec![("↑/↓", "scroll"), ("esc", "close")],
         Overlay::CleanupError(_) => vec![("esc", "close")],
+        Overlay::UpdatePrompt => {
+            if app.update_enabled()
+                && app
+                    .update_notice()
+                    .is_some_and(|notice| !notice.installed())
+            {
+                vec![("enter", "install"), ("esc", "later")]
+            } else {
+                vec![("esc", "close")]
+            }
+        }
+        Overlay::UpdateBusy => vec![("installer", "running")],
+        Overlay::UpdateResult(state) => {
+            if state.success {
+                vec![("↑/↓", "scroll"), ("restart", "amph")]
+            } else {
+                vec![("↑/↓", "scroll"), ("u", "retry"), ("esc", "close")]
+            }
+        }
         Overlay::None => match app.active_tab {
             Tab::Dashboard => vec![
                 ("1-7", "tabs"),
@@ -124,7 +143,25 @@ fn hints_for(app: &App) -> Vec<(&'static str, &'static str)> {
                 ("?", "keys"),
             ],
         },
+    };
+
+    if matches!(app.overlay, Overlay::None)
+        && let Some(notice) = app.update_notice()
+    {
+        hints.insert(
+            0,
+            (
+                "u",
+                if notice.installed() {
+                    "restart"
+                } else {
+                    "update"
+                },
+            ),
+        );
     }
+
+    hints
 }
 
 fn footer_right(app: &App) -> String {

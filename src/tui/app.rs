@@ -14,6 +14,7 @@ use crate::tui::event::{InputEvent, ScanMessage};
 use crate::tui::metrics::{self, Analysis, Check, GraphData, Metrics};
 use crate::tui::model::{Package, Snapshot, TimelineItem, format_size};
 use crate::tui::theme::{Theme, ThemeKind};
+use crate::tui::update::{UpdateError, UpdateInfo, UpdateOutcome, UpdateRequest};
 
 pub const TAB_COUNT: usize = 7;
 
@@ -223,6 +224,9 @@ pub enum Overlay {
     CleanupPreview(CleanupPreviewState),
     CleanupResult(CleanupResultState),
     CleanupError(CleanupErrorState),
+    UpdatePrompt,
+    UpdateBusy,
+    UpdateResult(UpdateResultState),
 }
 
 impl Overlay {
@@ -237,6 +241,54 @@ impl Overlay {
     }
 }
 
+/// Where an announced update stands in the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdatePhase {
+    /// A newer version was reported; the install action is available.
+    Available,
+    /// The host installer reported success; a restart is required.
+    Installed,
+}
+
+/// The update banner's persistent state. This outlives the modal prompt so the
+/// install action (or the restart reminder) stays visible on every tab.
+#[derive(Debug, Clone)]
+pub struct UpdateNotice {
+    info: UpdateInfo,
+    phase: UpdatePhase,
+}
+
+impl UpdateNotice {
+    fn available(info: UpdateInfo) -> Self {
+        Self {
+            info,
+            phase: UpdatePhase::Available,
+        }
+    }
+
+    pub fn info(&self) -> &UpdateInfo {
+        &self.info
+    }
+
+    pub fn phase(&self) -> UpdatePhase {
+        self.phase
+    }
+
+    pub fn installed(&self) -> bool {
+        self.phase == UpdatePhase::Installed
+    }
+}
+
+/// The install handler's result, as shown in the modal and banner afterwards.
+#[derive(Debug, Clone)]
+pub struct UpdateResultState {
+    pub version: String,
+    pub success: bool,
+    pub output: String,
+    pub note: Option<String>,
+    pub scroll: u16,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RowHit {
     pub rect: Rect,
@@ -247,12 +299,18 @@ pub struct RowHit {
 pub struct UiHits {
     pub tabs: Vec<(Rect, Tab)>,
     pub rows: Vec<RowHit>,
+    /// The update banner, when one is on screen.
+    pub update: Option<Rect>,
+    /// The Install control inside the update prompt.
+    pub update_install: Option<Rect>,
 }
 
 impl UiHits {
     pub fn clear(&mut self) {
         self.tabs.clear();
         self.rows.clear();
+        self.update = None;
+        self.update_install = None;
     }
 }
 
@@ -442,6 +500,9 @@ pub struct App {
     pub(crate) cleanup_selected: BTreeSet<String>,
     pub(crate) cleanup_queue: VecDeque<CleanupRequest>,
     pub(crate) cleanup_enabled: bool,
+    pub(crate) update: Option<UpdateNotice>,
+    pub(crate) update_queue: VecDeque<UpdateRequest>,
+    pub(crate) update_enabled: bool,
     pub(crate) filter_edit: Option<FilterEdit>,
     pub(crate) overlay: Overlay,
     pub(crate) scan: ScanState,
@@ -485,6 +546,9 @@ impl App {
             cleanup_selected: BTreeSet::new(),
             cleanup_queue: VecDeque::new(),
             cleanup_enabled: false,
+            update: None,
+            update_queue: VecDeque::new(),
+            update_enabled: false,
             filter_edit: None,
             overlay: Overlay::None,
             scan: ScanState::new(),
@@ -520,6 +584,10 @@ impl App {
 
     pub(crate) fn set_cleanup_enabled(&mut self, enabled: bool) {
         self.cleanup_enabled = enabled;
+    }
+
+    pub(crate) fn set_update_enabled(&mut self, enabled: bool) {
+        self.update_enabled = enabled;
     }
 
     pub fn should_quit(&self) -> bool {
@@ -590,6 +658,9 @@ impl App {
             }
             ScanMessage::Snapshot(snapshot) => {
                 self.install_snapshot(snapshot);
+            }
+            ScanMessage::UpdateAvailable(info) => {
+                self.on_update_available(info);
             }
             ScanMessage::Warning(message) => {
                 self.toast(&message, ToastTone::Warning);
@@ -717,6 +788,170 @@ impl App {
     }
 
     // ---------------------------------------------------------------------
+    // Update flow
+    // ---------------------------------------------------------------------
+
+    fn on_update_available(&mut self, info: UpdateInfo) {
+        if !info.is_actionable() {
+            self.log_event(
+                SessionEventKind::Warning,
+                "Update check returned no version",
+                "The background check did not provide a target version, so no update action is offered.",
+            );
+            return;
+        }
+
+        // An installer is in flight; its result owns the screen and the banner.
+        if matches!(self.overlay, Overlay::UpdateBusy) {
+            return;
+        }
+
+        if let Some(existing) = &self.update {
+            if existing.installed() {
+                return;
+            }
+            if existing.info().latest() == info.latest() {
+                return;
+            }
+        }
+
+        let current = info.current().to_string();
+        let latest = info.latest().to_string();
+        self.update = Some(UpdateNotice::available(info));
+        self.toast(
+            &format!("Update available · {latest} · press u"),
+            ToastTone::Warning,
+        );
+        self.log_event(
+            SessionEventKind::Interface,
+            "Update available",
+            format!(
+                "GitHub main reports {latest}; this session runs {current}. Press u to review."
+            ),
+        );
+    }
+
+    fn open_update_prompt(&mut self) {
+        match self.update.as_ref() {
+            None => self.toast("No update available yet", ToastTone::Info),
+            Some(notice) if notice.installed() => {
+                self.toast(
+                    &format!(
+                        "Update installed · restart AMPH to load {}",
+                        notice.info().latest()
+                    ),
+                    ToastTone::Success,
+                );
+            }
+            Some(_) => {
+                self.overlay = Overlay::UpdatePrompt;
+                self.log_event(
+                    SessionEventKind::Interface,
+                    "Update prompt opened",
+                    "Install only runs through the injected handler.",
+                );
+            }
+        }
+    }
+
+    /// Request the announced install from the injected handler.
+    ///
+    /// Shared by the Enter key and a click on the prompt's Install control. It
+    /// never runs an installer; it only queues the request for the main loop.
+    /// Returns `true` when a request was queued.
+    fn confirm_update_install(&mut self) -> bool {
+        if !self.update_enabled {
+            self.log_event(
+                SessionEventKind::Warning,
+                "Update install unavailable",
+                "No update handler is attached to this session, so no install was requested.",
+            );
+            return false;
+        }
+
+        let Some(notice) = self.update.as_ref().filter(|notice| !notice.installed()) else {
+            return false;
+        };
+        let version = notice.info().latest().to_string();
+        self.update_queue
+            .push_back(UpdateRequest::install(version.clone()));
+        self.overlay = Overlay::UpdateBusy;
+        self.log_event(
+            SessionEventKind::Safety,
+            "Update install requested",
+            format!(
+                "{version} sent to the injected handler. The terminal is suspended while it runs; the TUI executes nothing itself."
+            ),
+        );
+        true
+    }
+
+    pub(crate) fn take_update_request(&mut self) -> Option<UpdateRequest> {
+        self.update_queue.pop_front()
+    }
+
+    pub(crate) fn on_update_handler_result(
+        &mut self,
+        request: &UpdateRequest,
+        result: Result<UpdateOutcome, UpdateError>,
+    ) {
+        let version = request.version().to_string();
+        match result {
+            Ok(outcome) => {
+                let success = outcome.success;
+                if success && let Some(notice) = self.update.as_mut() {
+                    notice.phase = UpdatePhase::Installed;
+                }
+                self.overlay = Overlay::UpdateResult(UpdateResultState {
+                    version: version.clone(),
+                    success,
+                    output: outcome.output,
+                    note: outcome.note,
+                    scroll: 0,
+                });
+                if success {
+                    self.toast(
+                        &format!("Update installed · restart AMPH to load {version}"),
+                        ToastTone::Success,
+                    );
+                    self.log_event(
+                        SessionEventKind::Interface,
+                        "Update installed",
+                        format!(
+                            "{version} is installed. Restart AMPH to load it; this session keeps the version it started with."
+                        ),
+                    );
+                } else {
+                    self.toast(
+                        "Update installer reported failure · current version unchanged",
+                        ToastTone::Warning,
+                    );
+                    self.log_event(
+                        SessionEventKind::Warning,
+                        "Update install failed",
+                        format!("The handler reported failure for {version}."),
+                    );
+                }
+            }
+            Err(error) => {
+                let message = error.message().to_string();
+                self.overlay = Overlay::UpdateResult(UpdateResultState {
+                    version,
+                    success: false,
+                    output: message.clone(),
+                    note: None,
+                    scroll: 0,
+                });
+                self.toast(
+                    "Update installer failed · current version unchanged",
+                    ToastTone::Warning,
+                );
+                self.log_event(SessionEventKind::Error, "Update install failed", message);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
     // Input
     // ---------------------------------------------------------------------
 
@@ -766,6 +1001,7 @@ impl App {
             KeyCode::Char('t') => self.cycle_theme(true),
             KeyCode::Char('T') => self.cycle_theme(false),
             KeyCode::Char('i') => self.toggle_detail(),
+            KeyCode::Char('u') => self.open_update_prompt(),
             KeyCode::Char('s') if self.active_tab == Tab::Packages => self.cycle_sort(),
             KeyCode::Char(' ') if self.active_tab == Tab::Graph => {
                 self.graph_tree_state.toggle_selected();
@@ -910,6 +1146,48 @@ impl App {
                     self.overlay = Overlay::CleanupError(state);
                 }
             },
+            Overlay::UpdatePrompt => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('u') => {
+                        self.log_event(
+                            SessionEventKind::Interface,
+                            "Update prompt closed",
+                            "No install request was sent.",
+                        );
+                        return;
+                    }
+                    KeyCode::Enter if self.confirm_update_install() => return,
+                    _ => {}
+                }
+                self.overlay = Overlay::UpdatePrompt;
+            }
+            Overlay::UpdateBusy => {
+                self.overlay = Overlay::UpdateBusy;
+            }
+            Overlay::UpdateResult(mut state) => {
+                let max_scroll = state.output.lines().count().saturating_sub(1) as u16;
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                        return;
+                    }
+                    KeyCode::Char('u') if !state.success => {
+                        self.overlay = Overlay::UpdatePrompt;
+                        return;
+                    }
+                    KeyCode::Up => state.scroll = state.scroll.saturating_sub(1),
+                    KeyCode::Down => {
+                        state.scroll = state.scroll.saturating_add(1).min(max_scroll);
+                    }
+                    KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(8),
+                    KeyCode::PageDown => {
+                        state.scroll = state.scroll.saturating_add(8).min(max_scroll);
+                    }
+                    KeyCode::Home => state.scroll = 0,
+                    KeyCode::End => state.scroll = max_scroll,
+                    _ => {}
+                }
+                self.overlay = Overlay::UpdateResult(state);
+            }
         }
     }
 
@@ -960,12 +1238,33 @@ impl App {
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent) {
+        if matches!(self.overlay, Overlay::UpdatePrompt) {
+            // The prompt is modal: only its own Install control is clickable.
+            // Every other click is swallowed so it cannot reach the tabs, rows,
+            // banner, or graph underneath.
+            if self.update_enabled
+                && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && let Some(rect) = self.hits.update_install
+                && contains(rect, mouse.column, mouse.row)
+            {
+                self.confirm_update_install();
+            }
+            return;
+        }
+
         if !matches!(self.overlay, Overlay::None) {
             return;
         }
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(rect) = self.hits.update
+                    && contains(rect, mouse.column, mouse.row)
+                {
+                    self.open_update_prompt();
+                    return;
+                }
+
                 if let Some((_, tab)) = self
                     .hits
                     .tabs
@@ -1632,6 +1931,14 @@ impl App {
         self.cleanup_enabled
     }
 
+    pub fn update_notice(&self) -> Option<&UpdateNotice> {
+        self.update.as_ref()
+    }
+
+    pub fn update_enabled(&self) -> bool {
+        self.update_enabled
+    }
+
     pub fn stale_snapshot(&self) -> bool {
         self.stale_snapshot
     }
@@ -1874,6 +2181,288 @@ mod tests {
     fn explicit_theme_is_used_at_startup() {
         let app = App::new_with_theme(ThemeKind::Nord);
         assert_eq!(app.theme.kind, ThemeKind::Nord);
+    }
+
+    fn click(app: &mut App, column: u16, row: u16) {
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    fn update_info() -> UpdateInfo {
+        UpdateInfo::new("0.2.0-beta", "0.3.0")
+            .with_url("https://example.invalid/amph/releases")
+            .with_notes("Faster package scans.")
+    }
+
+    fn screen_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let mut text = String::new();
+        for y in area.y..area.y.saturating_add(area.height) {
+            for x in area.x..area.x.saturating_add(area.width) {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    text.push_str(cell.symbol());
+                }
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn update_notice_appears_without_stealing_focus() {
+        let mut app = App::new();
+        app.on_scan_message(ScanMessage::update_available(update_info()));
+
+        let notice = app.update_notice().expect("update notice");
+        assert_eq!(notice.info().latest(), "0.3.0");
+        assert!(!notice.installed());
+        assert_eq!(app.active_tab, Tab::Dashboard);
+        assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn update_prompt_without_a_handler_never_queues_an_install() {
+        let mut app = App::new();
+        app.on_scan_message(ScanMessage::update_available(update_info()));
+
+        app.on_key(key(KeyCode::Char('u')));
+        assert!(matches!(app.overlay, Overlay::UpdatePrompt));
+
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.take_update_request().is_none());
+        assert!(matches!(app.overlay, Overlay::UpdatePrompt));
+
+        app.on_key(key(KeyCode::Esc));
+        assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn update_prompt_queues_the_exact_announced_version() {
+        let mut app = App::new();
+        app.set_update_enabled(true);
+        app.on_scan_message(ScanMessage::update_available(update_info()));
+
+        app.on_key(key(KeyCode::Char('u')));
+        app.on_key(key(KeyCode::Enter));
+
+        let request = app.take_update_request().expect("install request");
+        assert_eq!(request.version(), "0.3.0");
+        assert!(matches!(app.overlay, Overlay::UpdateBusy));
+
+        // Modal keys cannot dismiss or duplicate work while the handler runs.
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Esc));
+        assert!(matches!(app.overlay, Overlay::UpdateBusy));
+        assert!(app.take_update_request().is_none());
+    }
+
+    #[test]
+    fn clicking_the_install_action_queues_the_update_once() {
+        let mut app = App::new();
+        app.set_update_enabled(true);
+        app.on_scan_message(ScanMessage::update_available(update_info()));
+        app.on_key(key(KeyCode::Char('u')));
+
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| crate::tui::views::draw(frame, &mut app))
+            .expect("prompt frame");
+        let target = app.hits.update_install.expect("install click target");
+
+        click(&mut app, target.x + 1, target.y);
+        let request = app.take_update_request().expect("install request");
+        assert_eq!(request.version(), "0.3.0");
+        assert!(matches!(app.overlay, Overlay::UpdateBusy));
+
+        // Once the terminal is suspending, further clicks cannot queue work.
+        click(&mut app, target.x + 1, target.y);
+        assert!(app.take_update_request().is_none());
+    }
+
+    #[test]
+    fn update_prompt_swallows_clicks_and_only_install_is_clickable() {
+        let mut app = App::new();
+        app.on_scan_message(ScanMessage::update_available(update_info()));
+        app.on_key(key(KeyCode::Char('u')));
+
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| crate::tui::views::draw(frame, &mut app))
+            .expect("prompt frame");
+
+        // With no handler the action is unavailable, so there is no target.
+        assert!(app.hits.update_install.is_none());
+        click(&mut app, 55, 15);
+        assert!(app.take_update_request().is_none());
+        assert!(matches!(app.overlay, Overlay::UpdatePrompt));
+
+        // A click on the Packages tab must not fall through the modal.
+        click(&mut app, 15, 2);
+        assert_eq!(app.active_tab, Tab::Dashboard);
+        assert!(matches!(app.overlay, Overlay::UpdatePrompt));
+
+        // With a handler the target exists, but clicks outside it still do
+        // nothing: no install, no tab change, prompt stays open.
+        app.set_update_enabled(true);
+        terminal
+            .draw(|frame| crate::tui::views::draw(frame, &mut app))
+            .expect("prompt frame with handler");
+        let target = app.hits.update_install.expect("install click target");
+        click(&mut app, target.x.saturating_sub(1), target.y);
+        assert!(app.take_update_request().is_none());
+        click(&mut app, 15, 2);
+        assert_eq!(app.active_tab, Tab::Dashboard);
+        assert!(matches!(app.overlay, Overlay::UpdatePrompt));
+    }
+
+    #[test]
+    fn successful_install_requires_a_restart_and_keeps_the_banner() {
+        let mut app = App::new();
+        app.set_update_enabled(true);
+        app.on_scan_message(ScanMessage::update_available(update_info()));
+        app.on_key(key(KeyCode::Char('u')));
+        app.on_key(key(KeyCode::Enter));
+        let request = app.take_update_request().expect("install request");
+
+        app.on_update_handler_result(
+            &request,
+            Ok(UpdateOutcome::new(true, "installed to ~/.cargo/bin")),
+        );
+        match &app.overlay {
+            Overlay::UpdateResult(state) => {
+                assert!(state.success);
+                assert_eq!(state.version, "0.3.0");
+            }
+            _ => panic!("expected update result overlay"),
+        }
+        assert!(app.update_notice().expect("notice").installed());
+
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.update_notice().expect("notice").installed());
+    }
+
+    #[test]
+    fn failed_install_keeps_the_update_action_available() {
+        let mut app = App::new();
+        app.set_update_enabled(true);
+        app.on_scan_message(ScanMessage::update_available(update_info()));
+        app.on_key(key(KeyCode::Char('u')));
+        app.on_key(key(KeyCode::Enter));
+        let request = app.take_update_request().expect("install request");
+
+        app.on_update_handler_result(
+            &request,
+            Err(UpdateError::new("simulated installer failure")),
+        );
+        match &app.overlay {
+            Overlay::UpdateResult(state) => {
+                assert!(!state.success);
+                assert!(state.output.contains("simulated installer failure"));
+            }
+            _ => panic!("expected update result overlay"),
+        }
+        assert!(!app.update_notice().expect("notice").installed());
+
+        // A failed result offers a direct retry path.
+        app.on_key(key(KeyCode::Char('u')));
+        assert!(matches!(app.overlay, Overlay::UpdatePrompt));
+    }
+
+    #[test]
+    fn update_key_does_not_hijack_filter_typing() {
+        let mut app = App::new();
+        app.set_update_enabled(true);
+        app.on_scan_message(ScanMessage::update_available(update_info()));
+        app.on_key(key(KeyCode::Char('/')));
+
+        app.on_key(key(KeyCode::Char('u')));
+
+        assert!(app.filter_edit().is_some());
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(app.active_filter(), "u");
+    }
+
+    #[test]
+    fn update_banner_is_visible_without_replacing_the_dashboard() {
+        let mut app = App::new();
+        app.on_scan_message(ScanMessage::snapshot(Snapshot::demo()));
+        app.on_scan_message(ScanMessage::finished());
+        app.set_update_enabled(true);
+        app.on_scan_message(ScanMessage::update_available(update_info()));
+
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| crate::tui::views::draw(frame, &mut app))
+            .expect("update frame");
+
+        let screen = screen_text(&terminal);
+        assert!(screen.contains("UPDATE AVAILABLE"));
+        assert!(screen.contains("0.3.0"));
+        assert!(screen.contains("Dashboard"));
+        assert!(screen.contains("HEALTH"));
+
+        app.on_key(key(KeyCode::Char('u')));
+        terminal
+            .draw(|frame| crate::tui::views::draw(frame, &mut app))
+            .expect("prompt frame");
+        let prompt = screen_text(&terminal);
+        assert!(prompt.contains("UPDATE AVAILABLE"));
+        assert!(prompt.contains("Install update"));
+        assert!(prompt.contains("Click Install or press Enter"));
+    }
+
+    #[test]
+    fn update_banner_and_prompt_render_on_compact_terminals() {
+        let mut app = App::new();
+        app.set_update_enabled(true);
+        app.on_scan_message(ScanMessage::update_available(update_info()));
+
+        for (width, height) in [(40, 12), (64, 20), (80, 24)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|frame| crate::tui::views::draw(frame, &mut app))
+                .expect("compact banner frame");
+
+            app.on_key(key(KeyCode::Char('u')));
+            terminal
+                .draw(|frame| crate::tui::views::draw(frame, &mut app))
+                .expect("compact prompt frame");
+            app.on_key(key(KeyCode::Esc));
+        }
+    }
+
+    #[test]
+    fn successful_install_result_renders_the_restart_instruction() {
+        let mut app = App::new();
+        app.set_update_enabled(true);
+        app.on_scan_message(ScanMessage::update_available(update_info()));
+        app.on_key(key(KeyCode::Char('u')));
+        app.on_key(key(KeyCode::Enter));
+        let request = app.take_update_request().expect("install request");
+        app.on_update_handler_result(
+            &request,
+            Ok(UpdateOutcome::new(true, "installed to ~/.cargo/bin")),
+        );
+
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| crate::tui::views::draw(frame, &mut app))
+            .expect("result frame");
+
+        let screen = screen_text(&terminal);
+        assert!(screen.contains("RESTART AMPH"));
+        assert!(screen.contains("installed to ~/.cargo/bin"));
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub mod header;
 pub mod overlays;
 pub mod packages;
 pub mod timeline;
+pub mod update;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin};
@@ -35,10 +36,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let header_height = if inner.height >= 22 { 2 } else { 1 };
     let scan_height = if app.scan.is_active() { 2 } else { 0 };
+    // The update notice is one quiet line. On very short terminals it is
+    // skipped rather than squeezing the working area; `u` still opens it.
+    let update_height = if app.update_notice().is_some() && inner.height >= 10 {
+        1
+    } else {
+        0
+    };
 
     let chunks = Layout::vertical([
         Constraint::Length(header_height),
         Constraint::Length(1),
+        Constraint::Length(update_height),
         Constraint::Length(scan_height),
         Constraint::Min(0),
         Constraint::Length(1),
@@ -49,11 +58,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.layout.tab_bar = chunks[1];
     app.hits.tabs = widgets::tab_bar(frame, chunks[1], app);
 
-    if scan_height > 0 {
-        common::scan_strip(frame, chunks[2], app);
+    if update_height > 0 {
+        update::banner(frame, chunks[2], app);
     }
 
-    let body = chunks[3];
+    if scan_height > 0 {
+        common::scan_strip(frame, chunks[3], app);
+    }
+
+    let body = chunks[4];
     app.layout.body = body;
 
     let show_detail = app.detail_visible && body.width >= 74 && body.height >= 14;
@@ -73,7 +86,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         active_view(frame, app, body);
     }
 
-    footer::render(frame, chunks[4], app);
+    footer::render(frame, chunks[5], app);
     overlays::render(frame, app, screen);
 }
 
