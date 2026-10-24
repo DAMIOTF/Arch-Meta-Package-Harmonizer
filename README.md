@@ -12,6 +12,7 @@
 - **Harmonize:** find overlapping tools and get alternatives across package categories.
 - **Maintain:** inspect system checks, review pacman history, and preview protected cleanup candidates before confirmation.
 - **Reproduce:** export, compare and safely plan declarative TOML blueprints.
+- **Extend:** install community WASM analyzers and declarative themes from GitHub Releases in the plugin manager.
 - **Automate:** use `--json` output and `amph check` in scripts or cron.
 
 <img src="https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/1.jpg" alt="dashboard" width="75%" />
@@ -85,6 +86,16 @@ At TUI startup, AMPH checks the selected GitHub channel in the background. When 
 ### Update channels
 
 Two update channels are available: `main` (the default, stable branch) and `development` (newer, less tested builds). In the TUI, press `Shift+V` to open the channel selector. The selection is persisted in `$XDG_CONFIG_HOME/amph/update-channel` (falling back to `~/.config/amph/update-channel`) and is used by later `amph update` runs and update notices. Selecting a channel installs that Git branch immediately with Cargo, so switching from `main` to `development` (or back) replaces the running binary as part of the switch. If the channel file is missing or invalid, AMPH falls back to `main`.
+
+### Plugin manager
+
+Press `Shift+P` in the TUI to open the plugin manager. Paste a repository URL such as [`https://github.com/DAMIOTF/AMPH-example-plugin`](https://github.com/DAMIOTF/AMPH-example-plugin), review it, then confirm installation. The manager lists installed plugins, checks GitHub Releases for updates, offers **Update All**, lets you enable or disable a plugin, and asks for confirmation before removal. Plugins are stored per user in `$XDG_DATA_HOME/amph/plugins` (normally `~/.local/share/amph/plugins`).
+
+AMPH installs only the latest stable GitHub Release; it does not build or run repository source code. A release must contain a strict `plugin.json` manifest and, for a functionality plugin, its declared `.wasm` asset. GitHub must report a SHA-256 digest for each selected asset; AMPH verifies each digest before installation. Functionality plugins use the versioned analyzer ABI and run in an interpreter sandbox with no WASI, imports, filesystem, network, process, environment, or clock access. The host supplies a bounded JSON package snapshot only when you explicitly run an enabled analyzer (`a` in the manager); its JSON result is shown in the manager. The snapshot includes installed package names, versions, sizes, install reasons and dependency/provides metadata.
+
+Update checks compare the GitHub release tag and verified digests for the manifest and, for functionality plugins, the selected Wasm asset; they do not compare semantic versions. A changed asset digest is detected even if a repository reuses a release tag.
+
+Theme plugins are declarative manifests, not executable code. Select an enabled theme plugin and press `T` to apply it for the current AMPH session; it uses one of AMPH's built-in palettes with validated ANSI or `#RRGGBB` semantic colors. This initial plugin manager does not persist a selected plugin theme across restarts. Plugin authors can find the v1 manifest, ABI, build and release instructions in the [AMPH-example-plugin repository](https://github.com/DAMIOTF/AMPH-example-plugin). Only install plugins you trust, even though the WASM runtime denies host capabilities.
 
 <img src="https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/2.jpg" alt="dashboard" width="75%" />
 

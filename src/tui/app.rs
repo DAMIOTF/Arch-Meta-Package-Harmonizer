@@ -6,6 +6,7 @@ use crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::TableState;
+use serde_json::{Value, json};
 use tui_tree_widget::TreeState;
 
 use crate::tui::cleanup::{CleanupError, CleanupPhase, CleanupRequest, CleanupResponse};
@@ -13,6 +14,10 @@ use crate::tui::cleanup::{CleanupError, CleanupPhase, CleanupRequest, CleanupRes
 use crate::tui::event::{InputEvent, ScanMessage};
 use crate::tui::metrics::{self, Analysis, Check, GraphData, Metrics};
 use crate::tui::model::{Package, Snapshot, TimelineItem, format_size};
+use crate::tui::plugins::{
+    PLUGIN_ANALYZE_API, PLUGIN_DETAIL_MAX, PLUGIN_ROW_LIMIT, PLUGIN_URL_MAX, PluginAction,
+    PluginError, PluginOutcome, PluginRow, PluginRowKind, normalize_github_url, sanitize_text,
+};
 use crate::tui::theme::{Theme, ThemeKind};
 use crate::tui::update::{
     DEFAULT_CHANNEL, UPDATE_CHANNELS, UpdateError, UpdateInfo, UpdateOutcome, UpdateRequest,
@@ -218,6 +223,152 @@ pub struct CleanupErrorState {
     pub removal: bool,
 }
 
+/// The three workspace sections inside the plugin manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginSection {
+    Installed,
+    Add,
+    Updates,
+}
+
+impl PluginSection {
+    pub const ALL: [PluginSection; 3] = [
+        PluginSection::Installed,
+        PluginSection::Add,
+        PluginSection::Updates,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PluginSection::Installed => "Installed",
+            PluginSection::Add => "Add from GitHub",
+            PluginSection::Updates => "Updates",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            PluginSection::Installed => "Installed",
+            PluginSection::Add => "Add",
+            PluginSection::Updates => "Updates",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|section| *section == self)
+            .unwrap_or(0)
+    }
+
+    fn step(self, delta: isize) -> Self {
+        let count = Self::ALL.len() as isize;
+        let index = (self.index() as isize + delta).rem_euclid(count);
+        Self::ALL[index as usize]
+    }
+}
+
+/// A repository waiting for the explicit install review.
+#[derive(Debug, Clone)]
+pub struct PluginInstallReview {
+    pub url: String,
+    pub repository: String,
+}
+
+/// The explicit confirmation shown before a remove action is queued.
+#[derive(Debug, Clone)]
+pub struct PluginRemoveConfirm {
+    pub id: String,
+    pub name: String,
+}
+
+/// The explicit confirmation shown before a functionality analysis is queued.
+#[derive(Debug, Clone)]
+pub struct PluginAnalyzeConfirm {
+    pub id: String,
+    pub name: String,
+    pub package_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginNoticeTone {
+    Info,
+    Success,
+    Warning,
+    Danger,
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginNotice {
+    pub tone: PluginNoticeTone,
+    pub title: String,
+    pub detail: Option<String>,
+}
+
+/// All plugin-manager interface state. It is intentionally local and
+/// display-only; the host owns installation, updates, and removal.
+#[derive(Debug, Clone)]
+pub struct PluginManagerState {
+    pub(crate) rows: Vec<PluginRow>,
+    pub(crate) section: PluginSection,
+    pub(crate) installed_cursor: usize,
+    pub(crate) update_cursor: usize,
+    pub(crate) url_input: String,
+    pub(crate) url_error: Option<String>,
+    pub(crate) review: Option<PluginInstallReview>,
+    pub(crate) remove_confirm: Option<PluginRemoveConfirm>,
+    pub(crate) analyze_confirm: Option<PluginAnalyzeConfirm>,
+    pub(crate) notice: Option<PluginNotice>,
+    pub(crate) busy: Option<PluginAction>,
+    pub(crate) updates_checked: bool,
+}
+
+impl Default for PluginManagerState {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            section: PluginSection::Installed,
+            installed_cursor: 0,
+            update_cursor: 0,
+            url_input: String::new(),
+            url_error: None,
+            review: None,
+            remove_confirm: None,
+            analyze_confirm: None,
+            notice: None,
+            busy: None,
+            updates_checked: false,
+        }
+    }
+}
+
+impl PluginManagerState {
+    pub(crate) fn update_rows(&self) -> Vec<&PluginRow> {
+        self.rows.iter().filter(|row| row.has_update()).collect()
+    }
+
+    pub(crate) fn update_count(&self) -> usize {
+        self.rows.iter().filter(|row| row.has_update()).count()
+    }
+
+    pub(crate) fn selected_plugin(&self) -> Option<&PluginRow> {
+        match self.section {
+            PluginSection::Installed => self.rows.get(self.installed_cursor),
+            PluginSection::Updates => self.update_rows().get(self.update_cursor).copied(),
+            PluginSection::Add => None,
+        }
+    }
+
+    fn clamp_selection(&mut self) {
+        self.installed_cursor = clamp_cursor(self.installed_cursor, self.rows.len());
+        self.update_cursor = clamp_cursor(self.update_cursor, self.update_count());
+    }
+}
+
+fn clamp_cursor(cursor: usize, len: usize) -> usize {
+    if len == 0 { 0 } else { cursor.min(len - 1) }
+}
+
 #[derive(Debug, Clone)]
 pub enum Overlay {
     None,
@@ -233,6 +384,9 @@ pub enum Overlay {
     /// Channel selection opened with `Shift+V`. The highlighted row lives in
     /// [`App::channel_cursor`] so a host channel update cannot move it.
     ChannelPicker,
+    /// The workspace plugin manager, opened with `Shift+P`. It is a modal so
+    /// the seven top-level tabs stay unchanged.
+    Plugins,
 }
 
 impl Overlay {
@@ -509,6 +663,9 @@ pub struct App {
     pub(crate) update: Option<UpdateNotice>,
     pub(crate) update_queue: VecDeque<UpdateRequest>,
     pub(crate) update_enabled: bool,
+    pub(crate) plugin_state: PluginManagerState,
+    pub(crate) plugin_queue: VecDeque<PluginAction>,
+    pub(crate) plugins_enabled: bool,
     /// The channel the host has persisted, mirrored locally for display.
     pub(crate) update_channel: String,
     /// Highlighted row while the channel picker is open.
@@ -559,6 +716,9 @@ impl App {
             update: None,
             update_queue: VecDeque::new(),
             update_enabled: false,
+            plugin_state: PluginManagerState::default(),
+            plugin_queue: VecDeque::new(),
+            plugins_enabled: false,
             update_channel: DEFAULT_CHANNEL.to_string(),
             channel_cursor: 0,
             filter_edit: None,
@@ -600,6 +760,53 @@ impl App {
 
     pub(crate) fn set_update_enabled(&mut self, enabled: bool) {
         self.update_enabled = enabled;
+    }
+
+    pub(crate) fn set_plugins_enabled(&mut self, enabled: bool) {
+        self.plugins_enabled = enabled;
+    }
+
+    /// Replace the installed plugin list with authoritative host state.
+    ///
+    /// Rows with an empty id are ignored because the manager cannot address them
+    /// safely in update or remove actions. Duplicate ids keep the first row and
+    /// the list is capped at [`PLUGIN_ROW_LIMIT`].
+    pub fn set_plugin_rows(&mut self, rows: Vec<PluginRow>) {
+        let mut accepted: Vec<PluginRow> = Vec::new();
+        for row in rows.into_iter().take(PLUGIN_ROW_LIMIT * 2) {
+            if row.id().is_empty() {
+                continue;
+            }
+            if accepted.iter().any(|existing| existing.id() == row.id()) {
+                continue;
+            }
+            accepted.push(row);
+            if accepted.len() >= PLUGIN_ROW_LIMIT {
+                break;
+            }
+        }
+        self.plugin_state.rows = accepted;
+        // A bare list does not prove that an update check ran.
+        self.plugin_state.updates_checked = false;
+        self.plugin_state.clamp_selection();
+        if let Some(confirm) = &self.plugin_state.remove_confirm
+            && !self
+                .plugin_state
+                .rows
+                .iter()
+                .any(|row| row.id() == confirm.id)
+        {
+            self.plugin_state.remove_confirm = None;
+        }
+        if let Some(confirm) = &self.plugin_state.analyze_confirm
+            && !self
+                .plugin_state
+                .rows
+                .iter()
+                .any(|row| row.id() == confirm.id)
+        {
+            self.plugin_state.analyze_confirm = None;
+        }
     }
 
     pub fn should_quit(&self) -> bool {
@@ -676,6 +883,15 @@ impl App {
             }
             ScanMessage::UpdateAvailable(info) => {
                 self.on_update_available(info);
+            }
+            ScanMessage::Plugins(rows) => {
+                self.set_plugin_rows(rows);
+                let count = self.plugin_state.rows.len();
+                self.log_event(
+                    SessionEventKind::Interface,
+                    "Plugin list received",
+                    format!("{count} plugin row(s) supplied by the host."),
+                );
             }
             ScanMessage::Warning(message) => {
                 self.toast(&message, ToastTone::Warning);
@@ -759,6 +975,11 @@ impl App {
         let cleanup_was_open = self.overlay.is_cleanup();
         self.inventory =
             Inventory::from_parts(packages, scanned_at.clone(), health_history, timeline);
+        if let Some(confirm) = self.plugin_state.analyze_confirm.as_mut() {
+            // The request is built when Enter is pressed, so keep the displayed
+            // snapshot size in step with the current inventory.
+            confirm.package_count = self.inventory.packages.len();
+        }
         self.sample = false;
         self.cleanup_selected.clear();
         self.cleanup_queue.clear();
@@ -1068,6 +1289,765 @@ impl App {
     }
 
     // ---------------------------------------------------------------------
+    // Plugin manager flow
+    // ---------------------------------------------------------------------
+
+    fn open_plugin_manager(&mut self) {
+        self.overlay = Overlay::Plugins;
+        self.plugin_state.section = PluginSection::Installed;
+        self.plugin_state.review = None;
+        self.plugin_state.remove_confirm = None;
+        self.plugin_state.analyze_confirm = None;
+        self.plugin_state.url_error = None;
+        self.plugin_state.notice = None;
+        self.plugin_state.clamp_selection();
+        self.log_event(
+            SessionEventKind::Interface,
+            "Plugin manager opened",
+            "Installed plugins, GitHub installs, and update checks are managed here. The TUI never installs, updates, or removes a plugin itself.",
+        );
+    }
+
+    fn close_plugin_manager(&mut self) {
+        self.overlay = Overlay::None;
+        self.plugin_state.review = None;
+        self.plugin_state.remove_confirm = None;
+        self.plugin_state.analyze_confirm = None;
+        self.plugin_state.url_error = None;
+        self.log_event(
+            SessionEventKind::Interface,
+            "Plugin manager closed",
+            "No plugin action was left in flight.",
+        );
+    }
+
+    /// Handle one key while the plugin manager is the active overlay.
+    ///
+    /// Returns `true` when the manager should close. The caller restores the
+    /// overlay when this returns `false`.
+    fn on_plugin_manager_key(&mut self, key: KeyEvent) -> bool {
+        if self.plugin_state.busy.is_some() {
+            return false;
+        }
+
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        if self.plugin_state.analyze_confirm.is_some() {
+            match key.code {
+                KeyCode::Enter => self.confirm_plugin_analyze(),
+                KeyCode::Esc => {
+                    self.plugin_state.analyze_confirm = None;
+                    self.log_event(
+                        SessionEventKind::Interface,
+                        "Plugin analysis cancelled",
+                        "No analyze request was sent.",
+                    );
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        if self.plugin_state.remove_confirm.is_some() {
+            match key.code {
+                KeyCode::Enter => self.confirm_plugin_remove(),
+                KeyCode::Esc => {
+                    self.plugin_state.remove_confirm = None;
+                    self.log_event(
+                        SessionEventKind::Interface,
+                        "Plugin removal cancelled",
+                        "No remove request was sent.",
+                    );
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        if self.plugin_state.review.is_some() {
+            match key.code {
+                KeyCode::Enter => self.confirm_plugin_install(),
+                KeyCode::Esc => {
+                    self.plugin_state.review = None;
+                    self.log_event(
+                        SessionEventKind::Interface,
+                        "Plugin install review closed",
+                        "No install request was sent.",
+                    );
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        if control {
+            if matches!(key.code, KeyCode::Char('u'))
+                && self.plugin_state.section == PluginSection::Add
+            {
+                self.plugin_state.url_input.clear();
+                self.plugin_state.url_error = None;
+            }
+            return false;
+        }
+
+        // URL entry owns printable keys and digits so an address can always be
+        // typed. Only Tab and Esc retain their manager meaning here.
+        if self.plugin_state.section == PluginSection::Add {
+            match key.code {
+                KeyCode::Esc => {
+                    self.close_plugin_manager();
+                    return true;
+                }
+                KeyCode::Tab => self.cycle_plugin_section(1),
+                KeyCode::BackTab => self.cycle_plugin_section(-1),
+                KeyCode::Enter => self.validate_plugin_url(),
+                KeyCode::Backspace => {
+                    self.plugin_state.url_input.pop();
+                    self.plugin_state.url_error = None;
+                }
+                KeyCode::Delete => {
+                    self.plugin_state.url_input.clear();
+                    self.plugin_state.url_error = None;
+                }
+                KeyCode::Char(character) if !alt => self.plugin_type_char(character),
+                _ => {}
+            }
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.close_plugin_manager();
+                return true;
+            }
+            KeyCode::Tab | KeyCode::Right => self.cycle_plugin_section(1),
+            KeyCode::BackTab | KeyCode::Left => self.cycle_plugin_section(-1),
+            KeyCode::Char('1') => self.set_plugin_section(PluginSection::Installed),
+            KeyCode::Char('2') => self.set_plugin_section(PluginSection::Add),
+            KeyCode::Char('3') => self.set_plugin_section(PluginSection::Updates),
+            KeyCode::Char('j') | KeyCode::Down => self.move_plugin_selection(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_plugin_selection(-1),
+            KeyCode::Char('g') | KeyCode::Home => self.jump_plugin_selection(false),
+            KeyCode::Char('G') | KeyCode::End => self.jump_plugin_selection(true),
+            KeyCode::Char('c') => self.request_plugin_check_updates(),
+            KeyCode::Char('U') => self.request_plugin_update_all(),
+            KeyCode::Char('R') => self.request_plugin_refresh(),
+            KeyCode::Char(' ') if self.plugin_state.section == PluginSection::Installed => {
+                self.request_plugin_toggle_enabled();
+            }
+            KeyCode::Char('a') if self.plugin_state.section == PluginSection::Installed => {
+                self.open_plugin_analyze_confirm();
+            }
+            KeyCode::Char('T') if self.plugin_state.section == PluginSection::Installed => {
+                self.apply_selected_plugin_theme();
+            }
+            KeyCode::Char('r') if self.plugin_state.section == PluginSection::Installed => {
+                self.open_plugin_remove_confirm();
+            }
+            KeyCode::Enter => self.enter_plugin_section(),
+            _ => {}
+        }
+        false
+    }
+
+    fn set_plugin_section(&mut self, section: PluginSection) {
+        if self.plugin_state.section == section {
+            return;
+        }
+        self.plugin_state.section = section;
+        self.plugin_state.review = None;
+        self.plugin_state.remove_confirm = None;
+        self.plugin_state.analyze_confirm = None;
+        self.plugin_state.url_error = None;
+        self.plugin_state.clamp_selection();
+    }
+
+    fn cycle_plugin_section(&mut self, delta: isize) {
+        self.set_plugin_section(self.plugin_state.section.step(delta));
+    }
+
+    fn move_plugin_selection(&mut self, delta: isize) {
+        match self.plugin_state.section {
+            PluginSection::Installed => {
+                let len = self.plugin_state.rows.len();
+                if len > 0 {
+                    let current = self.plugin_state.installed_cursor as isize;
+                    self.plugin_state.installed_cursor =
+                        (current + delta).clamp(0, len as isize - 1) as usize;
+                }
+            }
+            PluginSection::Updates => {
+                let len = self.plugin_state.update_count();
+                if len > 0 {
+                    let current = self.plugin_state.update_cursor as isize;
+                    self.plugin_state.update_cursor =
+                        (current + delta).clamp(0, len as isize - 1) as usize;
+                }
+            }
+            PluginSection::Add => {}
+        }
+    }
+
+    fn jump_plugin_selection(&mut self, end: bool) {
+        match self.plugin_state.section {
+            PluginSection::Installed => {
+                let len = self.plugin_state.rows.len();
+                if len > 0 {
+                    self.plugin_state.installed_cursor = if end { len - 1 } else { 0 };
+                }
+            }
+            PluginSection::Updates => {
+                let len = self.plugin_state.update_count();
+                if len > 0 {
+                    self.plugin_state.update_cursor = if end { len - 1 } else { 0 };
+                }
+            }
+            PluginSection::Add => {}
+        }
+    }
+
+    fn enter_plugin_section(&mut self) {
+        match self.plugin_state.section {
+            PluginSection::Installed => {
+                if self.plugin_state.selected_plugin().is_some() {
+                    self.set_plugin_notice(
+                        PluginNoticeTone::Info,
+                        "Space toggles · r removes",
+                        Some(
+                            "Enable/disable and removal both go through the host after confirmation."
+                                .to_string(),
+                        ),
+                    );
+                }
+            }
+            PluginSection::Add => self.validate_plugin_url(),
+            PluginSection::Updates => {
+                if self.plugin_state.update_count() == 0 {
+                    self.request_plugin_check_updates();
+                } else {
+                    self.request_plugin_update_all();
+                }
+            }
+        }
+    }
+
+    fn plugin_type_char(&mut self, character: char) {
+        if character.is_control() {
+            self.plugin_state.url_error =
+                Some("URLs cannot contain control characters.".to_string());
+            return;
+        }
+        if self.plugin_state.url_input.chars().count() >= PLUGIN_URL_MAX {
+            self.plugin_state.url_error = Some(format!(
+                "The URL is limited to {PLUGIN_URL_MAX} characters."
+            ));
+            return;
+        }
+        self.plugin_state.url_input.push(character);
+        self.plugin_state.url_error = None;
+    }
+
+    fn on_plugin_paste(&mut self, text: &str) {
+        if self.plugin_state.busy.is_some()
+            || self.plugin_state.review.is_some()
+            || self.plugin_state.remove_confirm.is_some()
+            || self.plugin_state.analyze_confirm.is_some()
+        {
+            return;
+        }
+
+        // Paste changes the working section to Add so a repository URL always
+        // lands where it can be reviewed.
+        self.set_plugin_section(PluginSection::Add);
+
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if text.chars().any(char::is_control) {
+            self.plugin_state.url_error =
+                Some("The pasted text contains control characters.".to_string());
+            return;
+        }
+        let current = self.plugin_state.url_input.chars().count();
+        let incoming = text.chars().count();
+        if current.saturating_add(incoming) > PLUGIN_URL_MAX {
+            self.plugin_state.url_error = Some(format!(
+                "The URL is limited to {PLUGIN_URL_MAX} characters."
+            ));
+            return;
+        }
+        self.plugin_state.url_input.push_str(text);
+        self.plugin_state.url_error = None;
+    }
+
+    fn validate_plugin_url(&mut self) {
+        match normalize_github_url(&self.plugin_state.url_input) {
+            Ok(url) => {
+                let repository = url
+                    .strip_prefix("https://github.com/")
+                    .unwrap_or(&url)
+                    .to_string();
+                self.plugin_state.url_input = url.clone();
+                self.plugin_state.review = Some(PluginInstallReview { url, repository });
+                self.plugin_state.url_error = None;
+                self.log_event(
+                    SessionEventKind::Interface,
+                    "Plugin install review opened",
+                    "Review the normalized repository, then press Enter to ask the host to install.",
+                );
+            }
+            Err(error) => {
+                self.plugin_state.review = None;
+                self.plugin_state.url_error = Some(error.message().to_string());
+            }
+        }
+    }
+
+    fn confirm_plugin_install(&mut self) {
+        let Some(review) = self.plugin_state.review.take() else {
+            return;
+        };
+        let action = PluginAction::Install {
+            url: review.url.clone(),
+        };
+        if self.queue_plugin_action(action) {
+            self.log_event(
+                SessionEventKind::Safety,
+                "Plugin install requested",
+                format!(
+                    "{} sent to the injected handler. Installation runs in the host's WASM sandbox; the TUI executes nothing itself.",
+                    review.repository
+                ),
+            );
+        } else {
+            self.plugin_state.review = Some(review);
+        }
+    }
+
+    fn open_plugin_remove_confirm(&mut self) {
+        let Some(row) = self.plugin_state.selected_plugin().cloned() else {
+            self.set_plugin_notice(
+                PluginNoticeTone::Info,
+                "No plugin selected",
+                Some("Choose an installed plugin with j/k first.".to_string()),
+            );
+            return;
+        };
+        self.plugin_state.remove_confirm = Some(PluginRemoveConfirm {
+            id: row.id().to_string(),
+            name: row.display_name().to_string(),
+        });
+        self.log_event(
+            SessionEventKind::Safety,
+            "Plugin removal confirmation opened",
+            format!(
+                "{} has not been touched. Enter confirms; Esc cancels.",
+                row.display_name()
+            ),
+        );
+    }
+
+    fn confirm_plugin_remove(&mut self) {
+        let Some(confirm) = self.plugin_state.remove_confirm.take() else {
+            return;
+        };
+        let action = PluginAction::Remove {
+            id: confirm.id.clone(),
+        };
+        if self.queue_plugin_action(action) {
+            self.log_event(
+                SessionEventKind::Safety,
+                "Plugin removal requested",
+                format!(
+                    "{} sent to the injected handler after explicit confirmation.",
+                    confirm.name
+                ),
+            );
+        } else {
+            self.plugin_state.remove_confirm = Some(confirm);
+        }
+    }
+
+    fn open_plugin_analyze_confirm(&mut self) {
+        let Some(row) = self.plugin_state.selected_plugin().cloned() else {
+            self.set_plugin_notice(
+                PluginNoticeTone::Info,
+                "No plugin selected",
+                Some("Choose a functionality plugin with j/k first.".to_string()),
+            );
+            return;
+        };
+        if !row.enabled() {
+            self.set_plugin_notice(
+                PluginNoticeTone::Warning,
+                "Plugin is disabled",
+                Some("Enable the plugin before analyzing packages.".to_string()),
+            );
+            return;
+        }
+        if row.kind() != PluginRowKind::Functionality {
+            self.set_plugin_notice(
+                PluginNoticeTone::Info,
+                "This plugin does not analyze",
+                Some("Only enabled functionality plugins can run an analysis.".to_string()),
+            );
+            return;
+        }
+        self.plugin_state.analyze_confirm = Some(PluginAnalyzeConfirm {
+            id: row.id().to_string(),
+            name: row.display_name().to_string(),
+            package_count: self.inventory.packages.len(),
+        });
+        self.log_event(
+            SessionEventKind::Safety,
+            "Plugin analysis confirmation opened",
+            format!(
+                "{} has not run. Enter sends the current package snapshot to the injected handler.",
+                row.display_name()
+            ),
+        );
+    }
+
+    fn confirm_plugin_analyze(&mut self) {
+        let Some(confirm) = self.plugin_state.analyze_confirm.take() else {
+            return;
+        };
+        let request = self.plugin_analysis_request();
+        let action = PluginAction::Analyze {
+            id: confirm.id.clone(),
+            request,
+        };
+        let package_count = confirm.package_count;
+        if self.queue_plugin_action(action) {
+            self.log_event(
+                SessionEventKind::Safety,
+                "Plugin analysis requested",
+                format!(
+                    "{} package(s) sent to {} through the injected handler. The plugin runs in the host's sandbox; the TUI executes nothing itself.",
+                    package_count, confirm.name
+                ),
+            );
+        } else {
+            self.plugin_state.analyze_confirm = Some(confirm);
+        }
+    }
+
+    /// The stable analyze request envelope documented on
+    /// [`PluginAction::Analyze`]. It contains only the current package snapshot;
+    /// no host handles, paths, capabilities, environment, or filesystem access.
+    fn plugin_analysis_request(&self) -> Value {
+        let packages = self
+            .inventory
+            .packages
+            .iter()
+            .map(|package| {
+                json!({
+                    "name": &package.name,
+                    "version": &package.version,
+                    "size": package.size,
+                    "explicit": package.explicit,
+                    "foreign": package.foreign,
+                    "depends": &package.depends,
+                    "provides": &package.provides,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "api": PLUGIN_ANALYZE_API,
+            "op": "analyze",
+            "snapshot": {
+                "scanned_at": &self.inventory.scanned_at,
+                "packages": packages,
+            }
+        })
+    }
+
+    fn apply_selected_plugin_theme(&mut self) {
+        let Some(row) = self.plugin_state.selected_plugin().cloned() else {
+            self.set_plugin_notice(
+                PluginNoticeTone::Info,
+                "No plugin selected",
+                Some("Choose a theme plugin with j/k first.".to_string()),
+            );
+            return;
+        };
+        if !row.enabled() {
+            self.set_plugin_notice(
+                PluginNoticeTone::Warning,
+                "Theme plugin is disabled",
+                Some("Enable the theme plugin before applying it.".to_string()),
+            );
+            return;
+        }
+        if row.kind() != PluginRowKind::Theme {
+            self.set_plugin_notice(
+                PluginNoticeTone::Info,
+                "This plugin is not a theme",
+                Some("Only enabled theme plugins can change the palette.".to_string()),
+            );
+            return;
+        }
+        let Some(spec) = row.theme_spec() else {
+            self.set_plugin_notice(
+                PluginNoticeTone::Warning,
+                "Theme data is missing",
+                Some("The plugin has no theme declaration to apply.".to_string()),
+            );
+            return;
+        };
+
+        match Theme::from_plugin_spec(spec) {
+            Ok(theme) => {
+                let name = row.display_name().to_string();
+                let monochrome = theme.is_monochrome();
+                self.theme = theme;
+                self.clear_request = true;
+                let detail = if monochrome {
+                    "NO_COLOR is active, so the palette stays monochrome. This session only; nothing was saved."
+                } else {
+                    "Applied to this session only; nothing was saved."
+                };
+                self.set_plugin_notice(
+                    PluginNoticeTone::Success,
+                    format!("Theme applied · {name}"),
+                    Some(detail.to_string()),
+                );
+                self.log_event(
+                    SessionEventKind::Interface,
+                    "Plugin theme applied",
+                    format!("{name} · {detail}"),
+                );
+            }
+            Err(error) => {
+                let message = error.message();
+                self.set_plugin_notice(
+                    PluginNoticeTone::Danger,
+                    "Theme not applied",
+                    Some(message.clone()),
+                );
+                self.log_event(SessionEventKind::Error, "Plugin theme rejected", message);
+            }
+        }
+    }
+
+    fn request_plugin_check_updates(&mut self) {
+        self.set_plugin_section(PluginSection::Updates);
+        if self.queue_plugin_action(PluginAction::CheckUpdates) {
+            self.log_event(
+                SessionEventKind::Interface,
+                "Plugin update check requested",
+                "The host checks each installed plugin and returns the refreshed rows.",
+            );
+        }
+    }
+
+    fn request_plugin_update_all(&mut self) {
+        if self.plugin_state.update_count() == 0 {
+            self.set_plugin_notice(
+                PluginNoticeTone::Info,
+                "No plugin updates available",
+                Some("Press c to ask the host for an update check.".to_string()),
+            );
+            return;
+        }
+        if self.queue_plugin_action(PluginAction::UpdateAll) {
+            self.log_event(
+                SessionEventKind::Safety,
+                "Plugin update all requested",
+                format!(
+                    "{} plugin(s) with an announced update sent to the injected handler.",
+                    self.plugin_state.update_count()
+                ),
+            );
+        }
+    }
+
+    fn request_plugin_toggle_enabled(&mut self) {
+        let Some(row) = self.plugin_state.selected_plugin().cloned() else {
+            self.set_plugin_notice(
+                PluginNoticeTone::Info,
+                "No plugin selected",
+                Some("Choose an installed plugin with j/k first.".to_string()),
+            );
+            return;
+        };
+        let enabled = !row.enabled();
+        let action = PluginAction::SetEnabled {
+            id: row.id().to_string(),
+            enabled,
+        };
+        if self.queue_plugin_action(action) {
+            self.log_event(
+                SessionEventKind::Safety,
+                if enabled {
+                    "Plugin enable requested"
+                } else {
+                    "Plugin disable requested"
+                },
+                format!(
+                    "{} sent to the injected handler. The store records the enabled state.",
+                    row.display_name()
+                ),
+            );
+        }
+    }
+
+    fn request_plugin_refresh(&mut self) {
+        if self.queue_plugin_action(PluginAction::Refresh) {
+            self.log_event(
+                SessionEventKind::Interface,
+                "Plugin refresh requested",
+                "The host re-reads the installed plugin list.",
+            );
+        }
+    }
+
+    fn queue_plugin_action(&mut self, action: PluginAction) -> bool {
+        if self.plugin_state.busy.is_some() {
+            return false;
+        }
+        if !self.plugins_enabled {
+            self.set_plugin_notice(
+                PluginNoticeTone::Warning,
+                "Plugin backend not attached",
+                Some(
+                    "This session can review plugins but cannot install, update, or remove them."
+                        .to_string(),
+                ),
+            );
+            self.log_event(
+                SessionEventKind::Warning,
+                "Plugin action unavailable",
+                "No plugin handler is attached, so no request was sent.",
+            );
+            return false;
+        }
+        self.plugin_queue.push_back(action.clone());
+        self.plugin_state.busy = Some(action);
+        true
+    }
+
+    fn set_plugin_notice(
+        &mut self,
+        tone: PluginNoticeTone,
+        title: impl Into<String>,
+        detail: Option<String>,
+    ) {
+        let title = sanitize_text(&title.into(), PLUGIN_DETAIL_MAX);
+        let title = if title.is_empty() {
+            "Plugin manager".to_string()
+        } else {
+            title
+        };
+        let detail = detail
+            .map(|detail| sanitize_text(&detail, PLUGIN_DETAIL_MAX))
+            .filter(|detail| !detail.is_empty());
+        self.plugin_state.notice = Some(PluginNotice {
+            tone,
+            title,
+            detail,
+        });
+    }
+
+    /// Drain the next action the host must perform. `run_internal` calls this
+    /// while the terminal is suspended.
+    pub(crate) fn take_plugin_action(&mut self) -> Option<PluginAction> {
+        self.plugin_queue.pop_front()
+    }
+
+    /// Whether a host handler is about to run and the busy screen should be
+    /// drawn before the terminal is suspended.
+    pub(crate) fn has_pending_handler_work(&self) -> bool {
+        !self.cleanup_queue.is_empty()
+            || !self.update_queue.is_empty()
+            || !self.plugin_queue.is_empty()
+    }
+
+    /// Apply the handler's result and refresh the manager's authoritative rows.
+    pub(crate) fn on_plugin_handler_result(
+        &mut self,
+        action: &PluginAction,
+        result: Result<PluginOutcome, PluginError>,
+    ) {
+        if self.plugin_state.busy.as_ref() != Some(action) {
+            self.log_event(
+                SessionEventKind::Warning,
+                "Plugin result ignored",
+                "A result did not match the action currently in flight.",
+            );
+            return;
+        }
+        self.plugin_state.busy = None;
+
+        match result {
+            Ok(outcome) => {
+                if let Some(rows) = outcome.plugins {
+                    let count = rows.len();
+                    self.set_plugin_rows(rows);
+                    self.log_event(
+                        SessionEventKind::Interface,
+                        "Plugin list refreshed",
+                        format!("{count} row(s) supplied by the handler."),
+                    );
+                }
+                if outcome.success
+                    && matches!(action, PluginAction::CheckUpdates | PluginAction::UpdateAll)
+                {
+                    self.plugin_state.updates_checked = true;
+                }
+                if matches!(action, PluginAction::Install { .. }) && outcome.success {
+                    self.plugin_state.url_input.clear();
+                    self.plugin_state.review = None;
+                    self.set_plugin_section(PluginSection::Installed);
+                }
+                if matches!(action, PluginAction::Remove { .. }) {
+                    self.plugin_state.remove_confirm = None;
+                }
+
+                let message = if outcome.message.is_empty() {
+                    "Plugin action finished".to_string()
+                } else {
+                    outcome.message.clone()
+                };
+                let tone = if outcome.success {
+                    PluginNoticeTone::Success
+                } else {
+                    PluginNoticeTone::Warning
+                };
+                self.set_plugin_notice(tone, message.clone(), outcome.detail.clone());
+                self.log_event(
+                    if outcome.success {
+                        SessionEventKind::Safety
+                    } else {
+                        SessionEventKind::Warning
+                    },
+                    if outcome.success {
+                        "Plugin action completed"
+                    } else {
+                        "Plugin action reported failure"
+                    },
+                    format!("{} · {message}", action.label()),
+                );
+            }
+            Err(error) => {
+                let message = error.message().to_string();
+                self.set_plugin_notice(
+                    PluginNoticeTone::Danger,
+                    "Plugin action failed",
+                    Some(message.clone()),
+                );
+                self.log_event(
+                    SessionEventKind::Error,
+                    "Plugin action failed",
+                    format!("{} · {message}", action.label()),
+                );
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
     // Input
     // ---------------------------------------------------------------------
 
@@ -1075,7 +2055,30 @@ impl App {
         match input {
             InputEvent::Key(key) => self.on_key(key),
             InputEvent::Mouse(mouse) => self.on_mouse(mouse),
+            InputEvent::Paste(text) => self.on_paste(text),
             InputEvent::Resize => {}
+        }
+    }
+
+    fn on_paste(&mut self, text: String) {
+        if self.filter_edit.is_some() {
+            let Some(edit) = self.filter_edit.clone() else {
+                return;
+            };
+            let sanitized = sanitize_text(&text, 120);
+            if sanitized.is_empty() {
+                return;
+            }
+            let mut value = self.filters.get(edit.tab).to_string();
+            let remaining = 120usize.saturating_sub(value.chars().count());
+            value.extend(sanitized.chars().take(remaining));
+            self.filters.set(edit.tab, value);
+            self.sync_selections();
+            return;
+        }
+
+        if matches!(self.overlay, Overlay::Plugins) {
+            self.on_plugin_paste(&text);
         }
     }
 
@@ -1117,6 +2120,16 @@ impl App {
             KeyCode::Char('t') => self.cycle_theme(true),
             KeyCode::Char('T') => self.cycle_theme(false),
             KeyCode::Char('i') => self.toggle_detail(),
+            // Shift+P opens the plugin manager on every tab. This arm sits
+            // before Cleanup's preview key so the old `P` preview binding can
+            // never consume it. Lowercase `p` remains the Cleanup preview key.
+            KeyCode::Char('P')
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !control
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.open_plugin_manager();
+            }
             KeyCode::Char('V')
                 if key.modifiers.contains(KeyModifiers::SHIFT)
                     && !control
@@ -1134,9 +2147,7 @@ impl App {
             KeyCode::Char('x') if self.active_tab == Tab::Cleanup => self.toggle_cleanup_cursor(),
             KeyCode::Char('a') if self.active_tab == Tab::Cleanup => self.select_all_cleanup(),
             KeyCode::Char('c') if self.active_tab == Tab::Cleanup => self.clear_cleanup(),
-            KeyCode::Char('p') | KeyCode::Char('P') if self.active_tab == Tab::Cleanup => {
-                self.open_cleanup_preview()
-            }
+            KeyCode::Char('p') if self.active_tab == Tab::Cleanup => self.open_cleanup_preview(),
             KeyCode::Enter => self.enter_active(),
             KeyCode::Esc => self.clear_context(),
             KeyCode::Char(character @ '1'..='7') => {
@@ -1269,6 +2280,11 @@ impl App {
                     self.overlay = Overlay::CleanupError(state);
                 }
             },
+            Overlay::Plugins => {
+                if !self.on_plugin_manager_key(key) {
+                    self.overlay = Overlay::Plugins;
+                }
+            }
             Overlay::ChannelPicker => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('V') => {
@@ -2093,6 +3109,20 @@ impl App {
         self.update_enabled
     }
 
+    pub fn plugins_enabled(&self) -> bool {
+        self.plugins_enabled
+    }
+
+    /// The installed plugin rows the manager is displaying.
+    pub fn plugin_rows(&self) -> &[PluginRow] {
+        &self.plugin_state.rows
+    }
+
+    /// How many installed plugins have an announced newer version.
+    pub fn plugin_update_count(&self) -> usize {
+        self.plugin_state.update_count()
+    }
+
     /// The channel the host currently has selected.
     pub fn update_channel(&self) -> &str {
         &self.update_channel
@@ -2214,8 +3244,10 @@ fn contains(rect: Rect, column: u16, row: u16) -> bool {
 mod tests {
     use super::*;
     use crate::tui::cleanup::{CleanupOutcome, CleanupPreview};
+    use amph::plugin::ThemeSpec;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -2821,6 +3853,465 @@ mod tests {
         let request = app.take_update_request().expect("development install");
         assert_eq!(request.version(), "0.4.0-beta");
         assert_eq!(request.branch(), "development");
+    }
+
+    fn plugin_app(enabled: bool) -> App {
+        let mut app = App::new();
+        app.on_scan_message(ScanMessage::snapshot(Snapshot::demo()));
+        app.on_scan_message(ScanMessage::finished());
+        app.set_plugins_enabled(enabled);
+        app.set_plugin_rows(vec![
+            PluginRow::new("alpha", "Alpha")
+                .with_version("1.0.0")
+                .with_repository("https://github.com/example/alpha")
+                .with_latest_version("1.1.0")
+                .with_kind(PluginRowKind::Functionality)
+                .with_api(1)
+                .with_entry("plugin.wasm"),
+            PluginRow::new("beta", "Beta")
+                .with_version("0.4.0")
+                .with_repository("https://github.com/example/beta")
+                .with_kind(PluginRowKind::Theme)
+                .with_theme_spec(ThemeSpec {
+                    palette: "nord".to_string(),
+                    accent: "#112233".to_string(),
+                    good: "green".to_string(),
+                    warn: "yellow".to_string(),
+                    bad: "red".to_string(),
+                    muted: "bright black".to_string(),
+                    info: "cyan".to_string(),
+                }),
+        ]);
+        app
+    }
+
+    fn open_plugin_manager(app: &mut App) {
+        app.on_key(shift_key(KeyCode::Char('P')));
+        assert!(matches!(app.overlay, Overlay::Plugins));
+    }
+
+    #[test]
+    fn shift_p_opens_plugins_before_cleanup_and_lowercase_p_still_previews() {
+        let mut app = ready_cleanup_app(true);
+        app.active_tab = Tab::Cleanup;
+
+        app.on_key(shift_key(KeyCode::Char('P')));
+        assert!(matches!(app.overlay, Overlay::Plugins));
+        assert!(app.take_cleanup_request().is_none());
+
+        app.on_key(key(KeyCode::Esc));
+        assert!(matches!(app.overlay, Overlay::None));
+
+        // Lowercase p keeps its original Cleanup preview role.
+        app.on_key(key(KeyCode::Char('p')));
+        assert!(matches!(app.overlay, Overlay::CleanupBusy));
+        let request = app.take_cleanup_request().expect("cleanup preview");
+        assert_eq!(request.phase(), CleanupPhase::Preview);
+    }
+
+    #[test]
+    fn host_plugin_rows_are_bounded_and_deduplicated() {
+        let mut app = App::new();
+        app.set_plugin_rows(vec![
+            PluginRow::new("", "ignored"),
+            PluginRow::new("one", "One\nPlugin")
+                .with_repository("https://github.com/example/one")
+                .with_version("1.0.0"),
+            PluginRow::new("one", "Duplicate"),
+            PluginRow::new("two", "Two"),
+        ]);
+
+        assert_eq!(app.plugin_rows().len(), 2);
+        assert_eq!(app.plugin_rows()[0].id(), "one");
+        assert_eq!(app.plugin_rows()[0].display_name(), "One Plugin");
+        assert_eq!(app.plugin_rows()[1].id(), "two");
+    }
+
+    #[test]
+    fn plugin_sections_navigate_without_losing_rows() {
+        let mut app = plugin_app(true);
+        open_plugin_manager(&mut app);
+        assert_eq!(app.plugin_state.section, PluginSection::Installed);
+
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.plugin_state.section, PluginSection::Add);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.plugin_state.section, PluginSection::Updates);
+        app.on_key(key(KeyCode::Char('1')));
+        assert_eq!(app.plugin_state.section, PluginSection::Installed);
+        assert_eq!(app.plugin_rows().len(), 2);
+    }
+
+    #[test]
+    fn pasted_url_is_reviewed_before_the_install_request() {
+        let mut app = plugin_app(true);
+        open_plugin_manager(&mut app);
+
+        app.on_input(InputEvent::Paste(
+            " https://github.com/owner/repo.git\n".to_string(),
+        ));
+        assert_eq!(app.plugin_state.section, PluginSection::Add);
+        assert_eq!(
+            app.plugin_state.url_input,
+            "https://github.com/owner/repo.git"
+        );
+        assert!(app.take_plugin_action().is_none());
+
+        app.on_key(key(KeyCode::Enter));
+        let review = app.plugin_state.review.as_ref().expect("review");
+        assert_eq!(review.repository, "owner/repo");
+        assert_eq!(review.url, "https://github.com/owner/repo");
+        assert!(app.take_plugin_action().is_none());
+
+        app.on_key(key(KeyCode::Enter));
+        let action = app.take_plugin_action().expect("install action");
+        assert_eq!(
+            action,
+            PluginAction::Install {
+                url: "https://github.com/owner/repo".to_string()
+            }
+        );
+        assert_eq!(app.plugin_state.busy.as_ref(), Some(&action));
+
+        app.on_plugin_handler_result(
+            &action,
+            Ok(
+                PluginOutcome::new(true, "Plugin installed").with_plugins(vec![
+                    PluginRow::new("repo", "Repo")
+                        .with_version("0.1.0")
+                        .with_repository("https://github.com/owner/repo"),
+                ]),
+            ),
+        );
+        assert!(app.plugin_state.busy.is_none());
+        assert_eq!(app.plugin_state.section, PluginSection::Installed);
+        assert!(app.plugin_state.url_input.is_empty());
+        assert_eq!(app.plugin_rows().len(), 1);
+        assert!(matches!(
+            app.plugin_state.notice.as_ref().map(|notice| notice.tone),
+            Some(PluginNoticeTone::Success)
+        ));
+    }
+
+    #[test]
+    fn invalid_or_control_urls_never_reach_the_host() {
+        let mut app = plugin_app(true);
+        open_plugin_manager(&mut app);
+        app.on_key(key(KeyCode::Char('2')));
+
+        app.on_input(InputEvent::Paste(
+            "https://gitlab.com/owner/repo".to_string(),
+        ));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.plugin_state.review.is_none());
+        assert!(app.plugin_state.url_error.is_some());
+        assert!(app.take_plugin_action().is_none());
+
+        app.on_input(InputEvent::Paste(
+            "https://github.com/a/b\u{0007}".to_string(),
+        ));
+        assert!(app.plugin_state.url_error.is_some());
+        assert!(app.take_plugin_action().is_none());
+    }
+
+    #[test]
+    fn removal_requires_an_explicit_confirmation() {
+        let mut app = plugin_app(true);
+        open_plugin_manager(&mut app);
+
+        app.on_key(key(KeyCode::Char('r')));
+        let confirm = app
+            .plugin_state
+            .remove_confirm
+            .as_ref()
+            .expect("remove confirmation");
+        assert_eq!(confirm.id, "alpha");
+        assert!(app.take_plugin_action().is_none());
+
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.plugin_state.remove_confirm.is_none());
+
+        app.on_key(key(KeyCode::Char('r')));
+        app.on_key(key(KeyCode::Enter));
+        let action = app.take_plugin_action().expect("remove action");
+        assert_eq!(
+            action,
+            PluginAction::Remove {
+                id: "alpha".to_string()
+            }
+        );
+
+        app.on_plugin_handler_result(
+            &action,
+            Ok(PluginOutcome::new(true, "Plugin removed")
+                .with_plugins(vec![PluginRow::new("beta", "Beta").with_version("0.4.0")])),
+        );
+        assert!(app.plugin_state.remove_confirm.is_none());
+        assert_eq!(app.plugin_rows().len(), 1);
+        assert_eq!(app.plugin_rows()[0].id(), "beta");
+    }
+
+    #[test]
+    fn check_updates_and_update_all_use_the_action_queue() {
+        let mut app = plugin_app(true);
+        open_plugin_manager(&mut app);
+        app.on_key(key(KeyCode::Char('3')));
+        assert_eq!(app.plugin_state.section, PluginSection::Updates);
+        assert_eq!(app.plugin_update_count(), 1);
+
+        app.on_key(key(KeyCode::Char('c')));
+        let check = app.take_plugin_action().expect("check action");
+        assert_eq!(check, PluginAction::CheckUpdates);
+        app.on_plugin_handler_result(
+            &check,
+            Ok(
+                PluginOutcome::new(true, "Update check finished").with_plugins(vec![
+                    PluginRow::new("alpha", "Alpha")
+                        .with_version("1.0.0")
+                        .with_latest_version("1.2.0"),
+                ]),
+            ),
+        );
+        assert!(app.plugin_state.updates_checked);
+        assert_eq!(app.plugin_update_count(), 1);
+
+        app.on_key(key(KeyCode::Char('U')));
+        let update_all = app.take_plugin_action().expect("update all");
+        assert_eq!(update_all, PluginAction::UpdateAll);
+    }
+
+    #[test]
+    fn analyze_action_uses_the_stable_snapshot_payload() {
+        let mut app = plugin_app(true);
+        open_plugin_manager(&mut app);
+        assert_eq!(app.plugin_state.installed_cursor, 0);
+
+        app.on_key(key(KeyCode::Char('a')));
+        let confirm = app
+            .plugin_state
+            .analyze_confirm
+            .as_ref()
+            .expect("analyze confirmation");
+        assert_eq!(confirm.id, "alpha");
+        assert_eq!(confirm.package_count, app.inventory.packages.len());
+        assert!(app.take_plugin_action().is_none());
+
+        app.on_key(key(KeyCode::Enter));
+        let action = app.take_plugin_action().expect("analyze action");
+        match action {
+            PluginAction::Analyze { id, request } => {
+                assert_eq!(id, "alpha");
+                assert_eq!(request["api"], 1);
+                assert_eq!(request["op"], "analyze");
+                assert!(request.get("handles").is_none());
+                assert!(request.get("capabilities").is_none());
+
+                let snapshot = &request["snapshot"];
+                assert_eq!(
+                    snapshot["scanned_at"].as_str(),
+                    Some(app.inventory.scanned_at.as_str())
+                );
+                let packages = snapshot["packages"]
+                    .as_array()
+                    .expect("package snapshot array");
+                assert_eq!(packages.len(), app.inventory.packages.len());
+                let first = packages[0].as_object().expect("package object");
+                assert_eq!(first.len(), 7);
+                for field in [
+                    "name", "version", "size", "explicit", "foreign", "depends", "provides",
+                ] {
+                    assert!(first.contains_key(field), "missing {field}");
+                }
+            }
+            other => panic!("expected analyze action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disabled_functionality_plugin_never_opens_analysis() {
+        let mut app = plugin_app(true);
+        app.set_plugin_rows(vec![
+            PluginRow::new("alpha", "Alpha")
+                .with_kind(PluginRowKind::Functionality)
+                .with_enabled(false),
+        ]);
+        open_plugin_manager(&mut app);
+
+        app.on_key(key(KeyCode::Char('a')));
+        assert!(app.plugin_state.analyze_confirm.is_none());
+        assert!(app.take_plugin_action().is_none());
+        assert!(matches!(
+            app.plugin_state.notice.as_ref().map(|notice| notice.tone),
+            Some(PluginNoticeTone::Warning)
+        ));
+    }
+
+    #[test]
+    fn apply_theme_changes_the_current_session_only() {
+        let mut app = plugin_app(true);
+        let before = app.theme.accent;
+        open_plugin_manager(&mut app);
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.plugin_state.installed_cursor, 1);
+
+        app.on_key(key(KeyCode::Char('T')));
+        assert_eq!(app.theme.kind, ThemeKind::Nord);
+        if std::env::var_os("NO_COLOR").is_none() {
+            assert_eq!(app.theme.accent, Color::Rgb(0x11, 0x22, 0x33));
+            assert_eq!(app.theme.positive, Color::Green);
+            assert_eq!(app.theme.warning, Color::Yellow);
+            assert_eq!(app.theme.danger, Color::Red);
+            assert_eq!(app.theme.muted, Color::DarkGray);
+            assert_eq!(app.theme.info, Color::Cyan);
+        } else {
+            assert!(app.theme.is_monochrome());
+        }
+        assert!(matches!(
+            app.plugin_state.notice.as_ref().map(|notice| notice.tone),
+            Some(PluginNoticeTone::Success)
+        ));
+        assert!(
+            app.plugin_state
+                .notice
+                .as_ref()
+                .and_then(|notice| notice.detail.as_deref())
+                .is_some_and(|detail| detail.contains("session only"))
+        );
+        if std::env::var_os("NO_COLOR").is_none() {
+            assert_ne!(app.theme.accent, before);
+        }
+        assert!(app.take_plugin_action().is_none());
+    }
+
+    #[test]
+    fn disabled_theme_plugin_is_not_applied() {
+        let mut app = plugin_app(true);
+        let before = app.theme.accent;
+        app.set_plugin_rows(vec![
+            PluginRow::new("beta", "Beta")
+                .with_kind(PluginRowKind::Theme)
+                .with_enabled(false)
+                .with_theme_spec(ThemeSpec {
+                    palette: "gruvbox".to_string(),
+                    accent: "red".to_string(),
+                    ..ThemeSpec::default()
+                }),
+        ]);
+        open_plugin_manager(&mut app);
+
+        app.on_key(key(KeyCode::Char('T')));
+        assert_eq!(app.theme.accent, before);
+        assert!(matches!(
+            app.plugin_state.notice.as_ref().map(|notice| notice.tone),
+            Some(PluginNoticeTone::Warning)
+        ));
+    }
+
+    #[test]
+    fn update_section_enter_updates_all_plugins() {
+        let mut app = plugin_app(true);
+        open_plugin_manager(&mut app);
+        app.on_key(key(KeyCode::Char('3')));
+
+        app.on_key(key(KeyCode::Enter));
+        let action = app.take_plugin_action().expect("update all");
+        assert_eq!(action, PluginAction::UpdateAll);
+    }
+
+    #[test]
+    fn space_toggles_the_selected_plugin_through_the_host() {
+        let mut app = plugin_app(true);
+        open_plugin_manager(&mut app);
+
+        app.on_key(key(KeyCode::Char(' ')));
+        let action = app.take_plugin_action().expect("disable action");
+        assert_eq!(
+            action,
+            PluginAction::SetEnabled {
+                id: "alpha".to_string(),
+                enabled: false,
+            }
+        );
+
+        app.on_plugin_handler_result(
+            &action,
+            Ok(
+                PluginOutcome::new(true, "Plugin disabled").with_plugins(vec![
+                    PluginRow::new("alpha", "Alpha")
+                        .with_version("1.0.0")
+                        .with_enabled(false),
+                ]),
+            ),
+        );
+        assert!(!app.plugin_rows()[0].enabled());
+
+        app.on_key(key(KeyCode::Char(' ')));
+        let action = app.take_plugin_action().expect("enable action");
+        assert_eq!(
+            action,
+            PluginAction::SetEnabled {
+                id: "alpha".to_string(),
+                enabled: true,
+            }
+        );
+    }
+
+    #[test]
+    fn missing_plugin_backend_blocks_actions_but_keeps_review() {
+        let mut app = plugin_app(false);
+        open_plugin_manager(&mut app);
+
+        app.on_key(key(KeyCode::Char('c')));
+        assert_eq!(app.plugin_state.section, PluginSection::Updates);
+        assert!(app.take_plugin_action().is_none());
+        assert!(app.plugin_state.busy.is_none());
+        assert!(matches!(
+            app.plugin_state.notice.as_ref().map(|notice| notice.tone),
+            Some(PluginNoticeTone::Warning)
+        ));
+
+        app.on_key(key(KeyCode::Char('2')));
+        app.on_input(InputEvent::Paste(
+            "https://github.com/owner/repo".to_string(),
+        ));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.plugin_state.review.is_some());
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.take_plugin_action().is_none());
+        assert!(app.plugin_state.review.is_some());
+    }
+
+    #[test]
+    fn plugin_manager_renders_on_compact_terminals() {
+        let mut app = plugin_app(true);
+        open_plugin_manager(&mut app);
+
+        for (width, height) in [(40, 12), (64, 20), (80, 24)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|frame| crate::tui::views::draw(frame, &mut app))
+                .expect("installed plugin frame");
+            let screen = screen_text(&terminal);
+            assert!(screen.contains("PLUGIN MANAGER"));
+            assert!(screen.contains("Installed"));
+        }
+
+        app.on_key(key(KeyCode::Char('2')));
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| crate::tui::views::draw(frame, &mut app))
+            .expect("add plugin frame");
+        assert!(screen_text(&terminal).contains("ADD FROM GITHUB"));
+
+        app.on_key(key(KeyCode::Tab));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| crate::tui::views::draw(frame, &mut app))
+            .expect("updates plugin frame");
+        assert!(screen_text(&terminal).contains("PLUGIN UPDATES"));
     }
 
     #[test]

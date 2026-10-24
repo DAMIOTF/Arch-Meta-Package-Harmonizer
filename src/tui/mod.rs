@@ -119,6 +119,44 @@
 //!
 //! tui::run_with_theme_and_update(tui_scan, theme, cleanup, installer)
 //! ```
+//!
+//! # Plugin manager
+//!
+//! `Shift+P` opens a workspace modal without adding an eighth tab. It has three
+//! sections: Installed, Add from GitHub, and Updates. A pasted GitHub URL is
+//! normalized and shown for review before any install request is queued.
+//! Removal always needs an explicit confirmation. Bracketed paste is enabled by
+//! the terminal session, so a URL arrives as one [`InputEvent::Paste`] value.
+//!
+//! The host supplies rows with [`ScanMessage::Plugins`] and can refresh them
+//! from operation results. [`plugin_host`] maps `InstalledPlugin` and
+//! `PluginUpdate` rows from `amph::plugin` into the bounded [`PluginRow`] DTO,
+//! and [`StorePluginHandler`] maps each action to the matching
+//! `PluginStore::{list, install, check_all, update_all, analyze_json,
+//! set_enabled, remove}` method. Theme plugins are declarative; functionality
+//! plugins use Wasm ABI v1 and run in the backend sandbox. The backend verifies
+//! GitHub release asset digests before publishing an install.
+//!
+//! Pressing `a` on an enabled functionality row asks for confirmation and
+//! queues [`PluginAction::Analyze`] with the current package snapshot. Pressing
+//! `T` on an enabled theme row applies that plugin's validated palette and
+//! semantic colors to this session only; it does not save configuration.
+//!
+//! The TUI queues [`PluginAction`] values; the full wrapper
+//! [`run_with_theme_and_update_and_plugins`] drains them into an injected
+//! [`PluginHandler`] with the terminal suspended. A handler returns
+//! [`PluginOutcome`] (including authoritative refreshed rows) or
+//! [`PluginError`].
+//!
+//! ```ignore
+//! let plugins = |action: tui::PluginAction| {
+//!     // Host code fetches, installs into its WASM sandbox, checks updates, or
+//!     // removes a plugin. It must not ask the TUI to perform that work.
+//!     Ok(tui::PluginOutcome::new(true, "Plugin action finished").with_plugins(rows))
+//! };
+//!
+//! tui::run_with_theme_and_update_and_plugins(tui_scan, theme, cleanup, installer, plugins)
+//! ```
 
 mod app;
 pub mod cleanup;
@@ -127,6 +165,8 @@ pub mod event;
 mod fuzzy;
 mod metrics;
 pub mod model;
+pub mod plugin_host;
+pub mod plugins;
 pub mod theme;
 pub mod update;
 pub mod views;
@@ -139,7 +179,9 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -147,14 +189,22 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-pub use app::{App, Tab, TimelineEntry};
+pub use app::{App, PluginSection, Tab, TimelineEntry};
 pub use cleanup::{
     CleanupError, CleanupHandler, CleanupHandlerResult, CleanupOutcome, CleanupPhase,
     CleanupPreview, CleanupRequest, CleanupResponse, ReadOnlyCleanupHandler,
 };
 pub use event::{InputEvent, ScanMessage};
 pub use model::{Package, Snapshot, TimelineItem, TimelineKind};
-pub use theme::{Theme, ThemeKind};
+pub use plugin_host::{
+    StorePluginHandler, rows_from_check, rows_from_installed, rows_from_updates,
+};
+pub use plugins::{
+    PLUGIN_ANALYZE_API, PLUGIN_URL_MAX, PluginAction, PluginError, PluginHandler,
+    PluginHandlerResult, PluginOutcome, PluginRow, PluginRowKind, PluginUrlError,
+    ReadOnlyPluginHandler, normalize_github_url,
+};
+pub use theme::{Theme, ThemeApplyError, ThemeColorField, ThemeKind, parse_ansi_color};
 pub use update::{
     ReadOnlyUpdateHandler, UpdateError, UpdateHandler, UpdateHandlerResult, UpdateInfo,
     UpdateOutcome, UpdateRequest,
@@ -174,6 +224,8 @@ pub fn run(scan: impl FnOnce(Sender<ScanMessage>) + Send + 'static) -> Result<()
         false,
         ReadOnlyUpdateHandler,
         false,
+        ReadOnlyPluginHandler,
+        false,
         None,
     )
 }
@@ -190,7 +242,16 @@ pub fn run_with_cleanup<H>(
 where
     H: CleanupHandler,
 {
-    run_internal(scan, handler, true, ReadOnlyUpdateHandler, false, None)
+    run_internal(
+        scan,
+        handler,
+        true,
+        ReadOnlyUpdateHandler,
+        false,
+        ReadOnlyPluginHandler,
+        false,
+        None,
+    )
 }
 
 /// Launch with an explicit initial palette and cleanup handler.
@@ -212,6 +273,8 @@ where
         true,
         ReadOnlyUpdateHandler,
         false,
+        ReadOnlyPluginHandler,
+        false,
         Some(theme),
     )
 }
@@ -226,6 +289,8 @@ pub fn run_read_only_with_theme(
         ReadOnlyCleanupHandler,
         false,
         ReadOnlyUpdateHandler,
+        false,
+        ReadOnlyPluginHandler,
         false,
         Some(theme),
     )
@@ -243,7 +308,16 @@ pub fn run_with_update<U>(
 where
     U: UpdateHandler,
 {
-    run_internal(scan, ReadOnlyCleanupHandler, false, update, true, None)
+    run_internal(
+        scan,
+        ReadOnlyCleanupHandler,
+        false,
+        update,
+        true,
+        ReadOnlyPluginHandler,
+        false,
+        None,
+    )
 }
 
 /// Read-only launch with an explicit palette and an update handler.
@@ -261,6 +335,8 @@ where
         false,
         update,
         true,
+        ReadOnlyPluginHandler,
+        false,
         Some(theme),
     )
 }
@@ -281,7 +357,50 @@ where
     C: CleanupHandler,
     U: UpdateHandler,
 {
-    run_internal(scan, cleanup, true, update, true, Some(theme))
+    run_internal(
+        scan,
+        cleanup,
+        true,
+        update,
+        true,
+        ReadOnlyPluginHandler,
+        false,
+        Some(theme),
+    )
+}
+
+/// Launch with a palette, cleanup handler, update handler, and plugin handler.
+///
+/// This is the full plugin-manager integration point. The TUI queues a
+/// [`PluginAction`] only after review or explicit confirmation; the injected
+/// [`PluginHandler`] runs with the terminal suspended and returns the
+/// authoritative refreshed [`PluginRow`] list through [`PluginOutcome`]. The
+/// TUI never installs, updates, or removes a plugin itself.
+///
+/// Initial plugin rows can be sent from the scanner with
+/// [`ScanMessage::Plugins`].
+pub fn run_with_theme_and_update_and_plugins<C, U, P>(
+    scan: impl FnOnce(Sender<ScanMessage>) + Send + 'static,
+    theme: ThemeKind,
+    cleanup: C,
+    update: U,
+    plugins: P,
+) -> Result<()>
+where
+    C: CleanupHandler,
+    U: UpdateHandler,
+    P: PluginHandler,
+{
+    run_internal(
+        scan,
+        cleanup,
+        true,
+        update,
+        true,
+        plugins,
+        true,
+        Some(theme),
+    )
 }
 
 /// Run a self-contained preview with a scripted sample scan.
@@ -316,17 +435,21 @@ pub fn run_demo() -> Result<()> {
     })
 }
 
-fn run_internal<C, U>(
+#[allow(clippy::too_many_arguments)]
+fn run_internal<C, U, P>(
     scan: impl FnOnce(Sender<ScanMessage>) + Send + 'static,
     mut cleanup_handler: C,
     cleanup_enabled: bool,
     mut update_handler: U,
     update_enabled: bool,
+    mut plugin_handler: P,
+    plugins_enabled: bool,
     theme: Option<ThemeKind>,
 ) -> Result<()>
 where
     C: CleanupHandler,
     U: UpdateHandler,
+    P: PluginHandler,
 {
     install_panic_hook();
 
@@ -337,6 +460,7 @@ where
     };
     app.set_cleanup_enabled(cleanup_enabled);
     app.set_update_enabled(update_enabled);
+    app.set_plugins_enabled(plugins_enabled);
 
     let (scan_tx, scan_rx) = mpsc::channel::<ScanMessage>();
     let worker = thread::Builder::new()
@@ -359,6 +483,15 @@ where
         // Pick up anything the scanner sent while the terminal was blocking.
         drain_scan(&scan_rx, &mut app);
 
+        // A host handler runs with the terminal suspended. Draw its busy modal
+        // first so the user sees what is about to happen instead of a bare
+        // shell while a network install or update check runs.
+        if app.has_pending_handler_work() {
+            session
+                .terminal
+                .draw(|frame| views::draw(frame, &mut app))?;
+        }
+
         while let Some(request) = app.take_cleanup_request() {
             let result = run_cleanup_handler(&mut session, &mut cleanup_handler, request.clone())?;
             app.on_cleanup_handler_result(&request, result);
@@ -367,6 +500,11 @@ where
         while let Some(request) = app.take_update_request() {
             let result = run_update_handler(&mut session, &mut update_handler, request.clone())?;
             app.on_update_handler_result(&request, result);
+        }
+
+        while let Some(action) = app.take_plugin_action() {
+            let result = run_plugin_handler(&mut session, &mut plugin_handler, action.clone())?;
+            app.on_plugin_handler_result(&action, result);
         }
 
         if app.take_clear_request() {
@@ -441,6 +579,32 @@ where
     }
 }
 
+fn run_plugin_handler<P>(
+    session: &mut TerminalSession,
+    handler: &mut P,
+    action: PluginAction,
+) -> Result<PluginHandlerResult>
+where
+    P: PluginHandler,
+{
+    session.suspend()?;
+    let result = panic::catch_unwind(AssertUnwindSafe(|| handler.handle(action)));
+    let resumed = session.resume();
+
+    match resumed {
+        Ok(()) => Ok(match result {
+            Ok(result) => result,
+            Err(_) => Err(PluginError::new(
+                "Plugin handler panicked; no result was applied. The plugin list may be unchanged.",
+            )),
+        }),
+        Err(error) => {
+            restore_terminal();
+            Err(error)
+        }
+    }
+}
+
 fn drain_scan(rx: &mpsc::Receiver<ScanMessage>, app: &mut App) {
     while let Ok(message) = rx.try_recv() {
         app.on_scan_message(message);
@@ -451,7 +615,12 @@ fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
 
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+    if let Err(error) = execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    ) {
         let _ = disable_raw_mode();
         return Err(error.into());
     }
@@ -493,6 +662,7 @@ fn restore_terminal() {
     let mut stdout = io::stdout();
     let _ = execute!(
         stdout,
+        DisableBracketedPaste,
         DisableMouseCapture,
         crossterm::cursor::Show,
         LeaveAlternateScreen
@@ -529,7 +699,12 @@ impl TerminalSession {
 
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        if let Err(error) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        ) {
             restore_terminal();
             return Err(error.into());
         }

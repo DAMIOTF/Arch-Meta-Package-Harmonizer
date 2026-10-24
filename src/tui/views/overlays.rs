@@ -51,6 +51,9 @@ pub fn render(frame: &mut Frame, app: &mut App, screen: Rect) {
         Overlay::ChannelPicker => {
             crate::tui::views::update::render_channel_picker(frame, screen, app);
         }
+        Overlay::Plugins => {
+            crate::tui::views::plugins::render_manager(frame, screen, app);
+        }
     }
 }
 
@@ -115,6 +118,7 @@ fn render_help(frame: &mut Frame, screen: Rect, app: &App) {
             key_line("i", "inspect panel", theme),
             key_line("u", "update AMPH", theme),
             key_line("shift+v", "update channel", theme),
+            key_line("shift+p", "plugin manager", theme),
             key_line("t", "cycle theme", theme),
             key_line("q", "quit", theme),
             Line::from(""),
@@ -150,6 +154,7 @@ fn render_help(frame: &mut Frame, screen: Rect, app: &App) {
         key_line("i", "toggle inspect panel", theme),
         key_line("u", "review / install update", theme),
         key_line("shift+v", "switch update channel", theme),
+        key_line("shift+p", "plugin manager", theme),
         key_line("t / T", "next / previous theme", theme),
         key_line("q", "quit", theme),
     ];
@@ -186,6 +191,27 @@ fn render_help(frame: &mut Frame, screen: Rect, app: &App) {
         Line::from(Span::styled(
             "Restart AMPH after installing.",
             Style::default().fg(theme.warning),
+        )),
+        help_heading("PLUGINS", theme),
+        key_line("shift+p", "open manager", theme),
+        key_line("tab / 1-3", "switch section", theme),
+        key_line("enter", "review / install", theme),
+        key_line("space", "enable / disable", theme),
+        key_line("a", "analyze functionality", theme),
+        key_line("T", "apply theme (session)", theme),
+        key_line("c / U", "check / update all", theme),
+        key_line("R", "refresh plugin list", theme),
+        Line::from(Span::styled(
+            "Paste a GitHub repository URL.",
+            Style::default().fg(theme.text),
+        )),
+        Line::from(Span::styled(
+            "Themes are declarative; functionality uses ABI v1.",
+            Style::default().fg(theme.muted),
+        )),
+        Line::from(Span::styled(
+            "Release assets require GitHub SHA-256 digests.",
+            Style::default().fg(theme.muted),
         )),
         help_heading("THEMES", theme),
         Line::from(Span::styled(

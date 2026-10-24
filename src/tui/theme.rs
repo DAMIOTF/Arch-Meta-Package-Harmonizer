@@ -1,5 +1,7 @@
 use std::env;
+use std::fmt;
 
+use amph::plugin::ThemeSpec;
 use ratatui::style::{Color, Modifier, Style};
 
 /// The four intentional palettes plus the `NO_COLOR` degradation path.
@@ -49,6 +51,97 @@ impl ThemeKind {
     }
 }
 
+/// Which semantic field in a plugin theme could not be applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeColorField {
+    Accent,
+    Good,
+    Warn,
+    Bad,
+    Muted,
+    Info,
+}
+
+impl ThemeColorField {
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemeColorField::Accent => "accent",
+            ThemeColorField::Good => "good",
+            ThemeColorField::Warn => "warn",
+            ThemeColorField::Bad => "bad",
+            ThemeColorField::Muted => "muted",
+            ThemeColorField::Info => "info",
+        }
+    }
+}
+
+/// Why a validated plugin theme could not be applied to this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeApplyError {
+    UnknownPalette,
+    InvalidColor(ThemeColorField),
+}
+
+impl ThemeApplyError {
+    pub fn message(self) -> String {
+        match self {
+            ThemeApplyError::UnknownPalette => {
+                "The theme palette is not one of the built-in AMPH palettes.".to_string()
+            }
+            ThemeApplyError::InvalidColor(field) => format!(
+                "The theme {} color is not a supported ANSI name or #RRGGBB value.",
+                field.label()
+            ),
+        }
+    }
+}
+
+impl fmt::Display for ThemeApplyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message())
+    }
+}
+
+impl std::error::Error for ThemeApplyError {}
+
+/// Parse the ANSI color names and exact `#RRGGBB` values promised by the
+/// plugin manifest documentation. Matching is case-insensitive; anything else
+/// is rejected.
+pub fn parse_ansi_color(value: &str) -> Option<Color> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "black" => Some(Color::Black),
+        "red" => Some(Color::Red),
+        "green" => Some(Color::Green),
+        "yellow" => Some(Color::Yellow),
+        "blue" => Some(Color::Blue),
+        "magenta" => Some(Color::Magenta),
+        "cyan" => Some(Color::Cyan),
+        "white" => Some(Color::White),
+        "gray" | "grey" => Some(Color::Gray),
+        "dark gray" | "dark grey" | "bright black" => Some(Color::DarkGray),
+        "bright red" => Some(Color::LightRed),
+        "bright green" => Some(Color::LightGreen),
+        "bright yellow" => Some(Color::LightYellow),
+        "bright blue" => Some(Color::LightBlue),
+        "bright magenta" => Some(Color::LightMagenta),
+        "bright cyan" => Some(Color::LightCyan),
+        "bright white" => Some(Color::White),
+        _ => parse_hex_color(&value),
+    }
+}
+
+fn parse_hex_color(value: &str) -> Option<Color> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let red = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let green = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let blue = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Color::Rgb(red, green, blue))
+}
+
 /// Semantic colors for the whole interface.
 ///
 /// Rendering code never uses a bare color literal. When `NO_COLOR` is present
@@ -88,6 +181,49 @@ impl Theme {
     pub fn from_kind(kind: ThemeKind) -> Self {
         let no_color = env::var_os("NO_COLOR").is_some();
         Self::new(kind, no_color)
+    }
+
+    /// Apply a validated plugin [`ThemeSpec`] to the current session.
+    ///
+    /// The built-in palette named by `spec.palette` supplies the layout colors,
+    /// then `accent`, `good`, `warn`, `bad`, `muted`, and `info` replace their
+    /// semantic counterparts. Every color is parsed strictly: only the
+    /// documented ANSI names and exact `#RRGGBB` values are accepted. `NO_COLOR`
+    /// still wins and leaves every color reset; parsing still rejects malformed
+    /// values so the result does not depend on the environment.
+    pub fn from_plugin_spec(spec: &ThemeSpec) -> Result<Self, ThemeApplyError> {
+        Self::from_plugin_spec_with_no_color(spec, env::var_os("NO_COLOR").is_some())
+    }
+
+    pub(crate) fn from_plugin_spec_with_no_color(
+        spec: &ThemeSpec,
+        no_color: bool,
+    ) -> Result<Self, ThemeApplyError> {
+        let kind = ThemeKind::from_name(&spec.palette).ok_or(ThemeApplyError::UnknownPalette)?;
+        let accent = parse_ansi_color(&spec.accent)
+            .ok_or(ThemeApplyError::InvalidColor(ThemeColorField::Accent))?;
+        let good = parse_ansi_color(&spec.good)
+            .ok_or(ThemeApplyError::InvalidColor(ThemeColorField::Good))?;
+        let warn = parse_ansi_color(&spec.warn)
+            .ok_or(ThemeApplyError::InvalidColor(ThemeColorField::Warn))?;
+        let bad = parse_ansi_color(&spec.bad)
+            .ok_or(ThemeApplyError::InvalidColor(ThemeColorField::Bad))?;
+        let muted = parse_ansi_color(&spec.muted)
+            .ok_or(ThemeApplyError::InvalidColor(ThemeColorField::Muted))?;
+        let info = parse_ansi_color(&spec.info)
+            .ok_or(ThemeApplyError::InvalidColor(ThemeColorField::Info))?;
+
+        let mut theme = Self::new(kind, no_color);
+        if no_color {
+            return Ok(theme);
+        }
+        theme.accent = accent;
+        theme.positive = good;
+        theme.warning = warn;
+        theme.danger = bad;
+        theme.muted = muted;
+        theme.info = info;
+        Ok(theme)
     }
 
     pub fn new(kind: ThemeKind, no_color: bool) -> Self {
@@ -318,5 +454,127 @@ mod tests {
         assert_eq!(theme.accent, Color::Reset);
         assert_eq!(theme.bg, Color::Reset);
         assert!(theme.is_monochrome());
+    }
+
+    #[test]
+    fn ansi_color_names_and_exact_hex_are_supported() {
+        for (name, color) in [
+            ("black", Color::Black),
+            ("RED", Color::Red),
+            ("Green", Color::Green),
+            ("yellow", Color::Yellow),
+            ("blue", Color::Blue),
+            ("magenta", Color::Magenta),
+            ("cyan", Color::Cyan),
+            ("white", Color::White),
+            ("gray", Color::Gray),
+            ("grey", Color::Gray),
+            ("dark gray", Color::DarkGray),
+            ("dark grey", Color::DarkGray),
+            ("bright black", Color::DarkGray),
+            ("bright red", Color::LightRed),
+            ("bright green", Color::LightGreen),
+            ("bright yellow", Color::LightYellow),
+            ("bright blue", Color::LightBlue),
+            ("bright magenta", Color::LightMagenta),
+            ("bright cyan", Color::LightCyan),
+            ("bright white", Color::White),
+        ] {
+            assert_eq!(parse_ansi_color(name), Some(color), "{name}");
+        }
+        assert_eq!(
+            parse_ansi_color("#112233"),
+            Some(Color::Rgb(0x11, 0x22, 0x33))
+        );
+        assert_eq!(
+            parse_ansi_color("#aAbBcC"),
+            Some(Color::Rgb(0xaa, 0xbb, 0xcc))
+        );
+    }
+
+    #[test]
+    fn unsupported_colors_are_rejected() {
+        for value in [
+            "",
+            "orange",
+            "light red",
+            "default",
+            "reset",
+            "16",
+            "#123",
+            "#12345",
+            "#1234567",
+            "#GG0000",
+            "#11223G",
+            "bright  red",
+        ] {
+            assert_eq!(parse_ansi_color(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn plugin_theme_applies_palette_and_semantic_overrides() {
+        let spec = ThemeSpec {
+            palette: "nord".to_string(),
+            accent: "#112233".to_string(),
+            good: "green".to_string(),
+            warn: "bright yellow".to_string(),
+            bad: "red".to_string(),
+            muted: "dark gray".to_string(),
+            info: "bright cyan".to_string(),
+        };
+        let theme = Theme::from_plugin_spec_with_no_color(&spec, false).expect("theme");
+        assert_eq!(theme.kind, ThemeKind::Nord);
+        assert_eq!(theme.accent, Color::Rgb(0x11, 0x22, 0x33));
+        assert_eq!(theme.positive, Color::Green);
+        assert_eq!(theme.warning, Color::LightYellow);
+        assert_eq!(theme.danger, Color::Red);
+        assert_eq!(theme.muted, Color::DarkGray);
+        assert_eq!(theme.info, Color::LightCyan);
+    }
+
+    #[test]
+    fn plugin_theme_honors_no_color() {
+        let spec = ThemeSpec {
+            palette: "gruvbox".to_string(),
+            accent: "#112233".to_string(),
+            ..ThemeSpec::default()
+        };
+        let theme = Theme::from_plugin_spec_with_no_color(&spec, true).expect("theme");
+        assert!(theme.is_monochrome());
+        assert_eq!(theme.kind, ThemeKind::Gruvbox);
+        for color in [
+            theme.bg,
+            theme.text,
+            theme.accent,
+            theme.positive,
+            theme.warning,
+            theme.danger,
+            theme.info,
+            theme.muted,
+        ] {
+            assert_eq!(color, Color::Reset);
+        }
+    }
+
+    #[test]
+    fn plugin_theme_rejects_unknown_palette_and_bad_color() {
+        let spec = ThemeSpec {
+            palette: "unknown".to_string(),
+            ..ThemeSpec::default()
+        };
+        assert!(matches!(
+            Theme::from_plugin_spec_with_no_color(&spec, false),
+            Err(ThemeApplyError::UnknownPalette)
+        ));
+
+        let spec = ThemeSpec {
+            accent: "orange".to_string(),
+            ..ThemeSpec::default()
+        };
+        assert!(matches!(
+            Theme::from_plugin_spec_with_no_color(&spec, false),
+            Err(ThemeApplyError::InvalidColor(ThemeColorField::Accent))
+        ));
     }
 }

@@ -104,6 +104,60 @@ fn hints_for(app: &App) -> Vec<(&'static str, &'static str)> {
                 vec![("j/k", "choose"), ("esc", "close")]
             }
         }
+        Overlay::Plugins => {
+            if let Some(action) = &app.plugin_state.busy {
+                vec![("handler", action.label())]
+            } else if app.plugin_state.analyze_confirm.is_some() {
+                vec![("enter", "analyze"), ("esc", "cancel")]
+            } else if app.plugin_state.remove_confirm.is_some() {
+                vec![("enter", "remove"), ("esc", "cancel")]
+            } else if app.plugin_state.review.is_some() {
+                vec![("enter", "install"), ("esc", "back")]
+            } else {
+                match app.plugin_state.section {
+                    crate::tui::app::PluginSection::Installed => {
+                        let mut hints = vec![("j/k", "move"), ("space", "on/off")];
+                        if let Some(row) = app.plugin_state.selected_plugin()
+                            && row.enabled()
+                        {
+                            match row.kind() {
+                                crate::tui::plugins::PluginRowKind::Functionality => {
+                                    hints.push(("a", "analyze"));
+                                }
+                                crate::tui::plugins::PluginRowKind::Theme => {
+                                    hints.push(("T", "apply theme"));
+                                }
+                                crate::tui::plugins::PluginRowKind::Unknown => {}
+                            }
+                        }
+                        hints.extend([
+                            ("r", "remove"),
+                            ("c", "updates"),
+                            ("U", "update all"),
+                            ("tab", "sections"),
+                            ("esc", "close"),
+                        ]);
+                        hints
+                    }
+                    crate::tui::app::PluginSection::Add => vec![
+                        ("type/paste", "URL"),
+                        ("enter", "review"),
+                        ("tab", "sections"),
+                        ("esc", "close"),
+                    ],
+                    crate::tui::app::PluginSection::Updates if app.plugin_update_count() == 0 => {
+                        vec![("enter", "check"), ("c", "check"), ("esc", "close")]
+                    }
+                    crate::tui::app::PluginSection::Updates => vec![
+                        ("j/k", "move"),
+                        ("enter", "update all"),
+                        ("U", "update all"),
+                        ("c", "check"),
+                        ("esc", "close"),
+                    ],
+                }
+            }
+        }
         Overlay::None => match app.active_tab {
             Tab::Dashboard => vec![
                 ("1-7", "tabs"),
@@ -172,6 +226,7 @@ fn hints_for(app: &App) -> Vec<(&'static str, &'static str)> {
             channel_at = 1;
         }
         hints.insert(channel_at, ("shift+v", "channel"));
+        hints.insert(channel_at + 1, ("shift+p", "plugins"));
     }
 
     hints

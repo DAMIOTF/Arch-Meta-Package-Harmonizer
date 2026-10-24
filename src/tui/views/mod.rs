@@ -9,6 +9,7 @@ pub mod harmony;
 pub mod header;
 pub mod overlays;
 pub mod packages;
+pub mod plugins;
 pub mod timeline;
 pub mod update;
 

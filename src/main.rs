@@ -23,6 +23,7 @@ use clap::{Args, Parser, Subcommand};
 use comfy_table::{Cell, ContentArrangement, Table, presets::UTF8_FULL};
 use serde_json::{Value, json};
 
+use amph::plugin::PluginStore;
 use analysis::blueprint::{self, ApplyCommand, ApplyOptions, Blueprint};
 use analysis::checks::{CheckStatus, ChecksReport};
 use analysis::harmony::{self, HarmonyConfig, Suggestion};
@@ -1834,7 +1835,46 @@ fn run_tui() -> Result<()> {
             Err(error) => Err(tui::UpdateError::new(format!("{error:#}"))),
         }
     };
-    tui::run_with_theme_and_update(tui_scan, theme, cleanup, installer)
+    let mut plugin_handler = discover_plugin_handler();
+    let plugin_store = plugin_handler
+        .as_ref()
+        .map(|handler| handler.store().clone());
+    let mut read_only_plugins = tui::ReadOnlyPluginHandler;
+    tui::run_with_theme_and_update_and_plugins(
+        move |tx| tui_scan(tx, plugin_store),
+        theme,
+        cleanup,
+        installer,
+        move |action| match plugin_handler.as_mut() {
+            Some(handler) => tui::PluginHandler::handle(handler, action),
+            None => tui::PluginHandler::handle(&mut read_only_plugins, action),
+        },
+    )
+}
+
+/// Discover the plugin store and confirm its initial listing is readable.
+///
+/// A missing or unreadable store must not prevent AMPH from starting. When the
+/// backend is unavailable the caller falls back to the read-only plugin
+/// handler, which refuses mutating actions instead of pretending they worked.
+fn discover_plugin_handler() -> Option<tui::StorePluginHandler> {
+    match tui::StorePluginHandler::discover() {
+        Ok(handler) => match handler.store().list() {
+            Ok(_) => Some(handler),
+            Err(error) => {
+                eprintln!(
+                    "warning: could not read installed plugins ({error:#}); plugin manager is read-only"
+                );
+                None
+            }
+        },
+        Err(error) => {
+            eprintln!(
+                "warning: could not locate the plugin store ({error:#}); plugin manager is read-only"
+            );
+            None
+        }
+    }
 }
 
 fn theme_kind_from_palette(value: &str) -> Option<tui::ThemeKind> {
@@ -1847,7 +1887,22 @@ fn theme_kind_from_palette(value: &str) -> Option<tui::ThemeKind> {
     }
 }
 
-fn tui_scan(tx: std::sync::mpsc::Sender<tui::ScanMessage>) {
+fn tui_scan(tx: std::sync::mpsc::Sender<tui::ScanMessage>, plugin_store: Option<PluginStore>) {
+    if let Some(store) = plugin_store.as_ref() {
+        match store.list() {
+            Ok(installed) => {
+                let _ = tx.send(tui::ScanMessage::plugins(tui::rows_from_installed(
+                    &installed,
+                )));
+            }
+            Err(error) => {
+                let _ = tx.send(tui::ScanMessage::warning(format!(
+                    "could not read installed plugins ({error:#}); plugin list may be incomplete"
+                )));
+            }
+        }
+    }
+
     let branch = update::current_branch();
     let _ = tx.send(tui::ScanMessage::update_channel(
         branch.as_str().to_string(),
