@@ -1197,21 +1197,22 @@ fn print_check_details(report: &ChecksReport) {
 // ---------------------------------------------------------------------------
 
 fn command_update(yes: bool, json: bool) -> Result<u8> {
-    let Some(available) = update::check_for_update()? else {
+    let branch = update::current_branch();
+    let Some(available) = update::check_for_update_on(branch)? else {
         if json {
             print_json(&json!({
                 "kind": "update",
                 "current": update::current_version(),
                 "update_available": false,
                 "installed": false,
-                "branch": update::BRANCH,
+                "branch": branch.as_str(),
                 "repository": update::REPOSITORY,
             }))?;
         } else {
             println!(
-                "amph v{} is up to date (GitHub branch {}).",
+                "amph v{} is up to date (GitHub {} channel).",
                 update::current_version(),
-                update::BRANCH
+                branch.as_str()
             );
         }
         return Ok(0);
@@ -1234,7 +1235,7 @@ fn command_update(yes: bool, json: bool) -> Result<u8> {
 
     if !json {
         println!(
-            "Update available: amph v{} -> v{} (GitHub branch {}).",
+            "Update available: amph v{} -> v{} (GitHub {} channel).",
             available.current, available.latest, available.branch
         );
         println!(
@@ -1817,12 +1818,21 @@ fn run_tui() -> Result<()> {
     };
 
     let cleanup = tui_cleanup_handler(&config);
-    let installer = |_request: tui::UpdateRequest| match update::install_update() {
-        Ok(()) => Ok(tui::UpdateOutcome::new(
-            true,
-            "Update installed. Restart AMPH to load the new version.",
-        )),
-        Err(error) => Err(tui::UpdateError::new(format!("{error:#}"))),
+    let installer = |request: tui::UpdateRequest| {
+        let branch = match update::UpdateBranch::parse(request.branch()) {
+            Ok(branch) => branch,
+            Err(error) => return Err(tui::UpdateError::new(format!("{error:#}"))),
+        };
+        match update::install_update_from_branch(branch) {
+            Ok(()) => Ok(tui::UpdateOutcome::new(
+                true,
+                format!(
+                    "Update installed from the {} channel. Restart AMPH to load the new version.",
+                    branch.as_str()
+                ),
+            )),
+            Err(error) => Err(tui::UpdateError::new(format!("{error:#}"))),
+        }
     };
     tui::run_with_theme_and_update(tui_scan, theme, cleanup, installer)
 }
@@ -1838,12 +1848,21 @@ fn theme_kind_from_palette(value: &str) -> Option<tui::ThemeKind> {
 }
 
 fn tui_scan(tx: std::sync::mpsc::Sender<tui::ScanMessage>) {
+    let branch = update::current_branch();
+    let _ = tx.send(tui::ScanMessage::update_channel(
+        branch.as_str().to_string(),
+    ));
+
     let update_tx = tx.clone();
     std::thread::spawn(move || {
-        if let Ok(Some(found)) = update::check_for_update() {
+        if let Ok(Some(found)) = update::check_for_update_on(branch) {
             let info = tui::UpdateInfo::new(found.current, found.latest)
+                .with_branch(found.branch)
                 .with_url(update::REPOSITORY)
-                .with_notes("Newer build available on GitHub main.");
+                .with_notes(format!(
+                    "Newer build available on the GitHub {} channel.",
+                    found.branch
+                ));
             let _ = update_tx.send(tui::ScanMessage::update_available(info));
         }
     });

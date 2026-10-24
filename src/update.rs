@@ -1,9 +1,11 @@
 //! GitHub update checks and Cargo self-install.
 //!
-//! The update channel is the `main` branch of the public GitHub repository.
-//! The version check downloads a bounded copy of that branch's `Cargo.toml`
-//! with `curl` (using argument arrays, never a shell) and compares its package
-//! version with the running binary's Cargo version.
+//! An update channel is one of two Git branches of the public GitHub
+//! repository: `main` or `development`. The selected channel is persisted as a
+//! tiny plain-text file, so update checks, CLI notices and installs all agree
+//! on the branch in use. The version check downloads a bounded copy of that
+//! branch's `Cargo.toml` with `curl` (using argument arrays, never a shell) and
+//! compares its package version with the running binary's Cargo version.
 //!
 //! [`check_for_update`] and [`install_update`] are intentionally small and
 //! synchronous so the TUI can call them from a worker thread later.
@@ -20,11 +22,47 @@ use anyhow::{Context, Result, anyhow, bail};
 
 /// Public repository used for update checks and Cargo installs.
 pub const REPOSITORY: &str = "https://github.com/DAMIOTF/Arch-Meta-Package-Harmonizer";
-/// Branch treated as the update channel.
-pub const BRANCH: &str = "main";
 
-const MANIFEST_URL: &str =
-    "https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/Cargo.toml";
+/// A Git branch that can be selected as the update channel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UpdateBranch {
+    #[default]
+    Main,
+    Development,
+}
+
+impl UpdateBranch {
+    /// Every selectable channel, in presentation order.
+    pub const ALL: [Self; 2] = [Self::Main, Self::Development];
+
+    /// Branch name used by Git, Cargo and the channel file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Development => "development",
+        }
+    }
+
+    /// Parse a persisted or requested channel.
+    ///
+    /// Only the exact enum names (ignoring surrounding whitespace) are
+    /// accepted; the result is later used to build a URL and a Cargo argument.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim() {
+            "main" => Ok(Self::Main),
+            "development" => Ok(Self::Development),
+            other => bail!(
+                "unknown update channel '{other}'; available channels are: {}",
+                Self::ALL
+                    .iter()
+                    .map(|branch| branch.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
 const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const NOTIFY_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
@@ -48,22 +86,56 @@ pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Check the update branch for a version newer than the running binary.
+/// The channel currently persisted for this user.
+///
+/// A missing, unreadable or invalid channel file falls back to
+/// [`UpdateBranch::Main`]. The file lives at
+/// `$XDG_CONFIG_HOME/amph/update-channel` (or `~/.config/amph/update-channel`).
+pub fn current_branch() -> UpdateBranch {
+    channel_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map_or_else(UpdateBranch::default, |text| {
+            selected_branch_from_text(Some(&text))
+        })
+}
+
+/// Check the currently selected channel for a version newer than the running
+/// binary.
 ///
 /// Network access is bounded by [`CHECK_TIMEOUT`]. Errors are returned so the
 /// caller can decide whether to report them; [`notify_if_update_available`]
 /// treats the same failures as non-fatal.
 pub fn check_for_update() -> Result<Option<UpdateAvailable>> {
-    let latest = fetch_latest_version(CHECK_TIMEOUT)?;
-    update_available_from(current_version(), &latest)
+    check_for_update_on(current_branch())
 }
 
-/// Install the latest `main` branch with Cargo.
+/// Check a specific channel for a version newer than the running binary.
+pub fn check_for_update_on(branch: UpdateBranch) -> Result<Option<UpdateAvailable>> {
+    let latest = fetch_latest_version(branch, CHECK_TIMEOUT)?;
+    update_available_from(current_version(), &latest, branch)
+}
+
+/// Install the latest build from the currently selected channel with Cargo.
 ///
 /// The current executable's Cargo root is used when it can be identified
 /// (for example `~/.cargo/bin/amph` -> `~/.cargo`). This function never runs
 /// `sudo`; permission failures are reported with an actionable message.
 pub fn install_update() -> Result<()> {
+    install_update_on(current_branch())
+}
+
+/// Persist `branch` as the selected channel and force-install that Git branch.
+///
+/// This is the entry point used by the TUI when the user switches channels:
+/// switching a channel installs immediately instead of waiting for the next
+/// update check. The channel is saved before Cargo runs so a successful switch
+/// is remembered even if the installation itself fails later.
+pub fn install_update_from_branch(branch: UpdateBranch) -> Result<()> {
+    save_current_branch(branch)?;
+    install_update_on(branch)
+}
+
+fn install_update_on(branch: UpdateBranch) -> Result<()> {
     let root = cargo_root_for_current_exe();
     if let Some(root) = root.as_deref()
         && let Ok(metadata) = fs::metadata(root)
@@ -79,7 +151,15 @@ pub fn install_update() -> Result<()> {
 
     let mut command = Command::new("cargo");
     command.args([
-        "install", "--git", REPOSITORY, "--branch", BRANCH, "--locked", "--force", "--bin", "amph",
+        "install",
+        "--git",
+        REPOSITORY,
+        "--branch",
+        branch.as_str(),
+        "--locked",
+        "--force",
+        "--bin",
+        "amph",
     ]);
     if let Some(root) = root.as_deref() {
         command.arg("--root").arg(root);
@@ -115,12 +195,14 @@ pub fn install_update() -> Result<()> {
 ///
 /// The notice is written to stderr, is skipped when stderr is not a terminal,
 /// and can be disabled with `AMPH_NO_UPDATE_CHECK=1`. Check results are cached
-/// for one day so ordinary CLI commands do not hit the network every time.
+/// per channel for one day so ordinary CLI commands do not hit the network
+/// every time.
 pub fn notify_if_update_available() {
     if update_check_disabled() || !io::stderr().is_terminal() {
         return;
     }
-    let Some(available) = cached_or_fetch_update() else {
+    let branch = current_branch();
+    let Some(available) = cached_or_fetch_update(branch) else {
         return;
     };
     eprintln!();
@@ -128,7 +210,10 @@ pub fn notify_if_update_available() {
         "Update available: amph v{} -> v{} (GitHub {}).",
         available.current, available.latest, available.branch
     );
-    eprintln!("Run `amph update` to install it.");
+    eprintln!(
+        "Run `amph update` to install it from the {} channel.",
+        available.branch
+    );
 }
 
 fn update_check_disabled() -> bool {
@@ -144,31 +229,77 @@ fn update_check_disabled() -> bool {
     }
 }
 
-fn cached_or_fetch_update() -> Option<UpdateAvailable> {
+fn cached_or_fetch_update(branch: UpdateBranch) -> Option<UpdateAvailable> {
     let now = now_secs();
-    if let Some((checked_at, latest)) = read_cached_version()
+    if let Some((checked_at, latest)) = read_cached_version(branch)
         && now.saturating_sub(checked_at) < UPDATE_CACHE_TTL_SECS
-        && let Ok(available) = update_available_from(current_version(), &latest)
+        && let Ok(available) = update_available_from(current_version(), &latest, branch)
     {
         return available;
     }
 
-    let latest = fetch_latest_version(NOTIFY_TIMEOUT).ok()?;
-    write_cached_version(&latest);
-    update_available_from(current_version(), &latest)
+    let latest = fetch_latest_version(branch, NOTIFY_TIMEOUT).ok()?;
+    write_cached_version(branch, &latest);
+    update_available_from(current_version(), &latest, branch)
         .ok()
         .flatten()
 }
 
-fn cache_path() -> Option<PathBuf> {
+fn channel_path() -> Option<PathBuf> {
+    config_home().map(|base| base.join("amph").join("update-channel"))
+}
+
+fn config_home() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
+        let path = PathBuf::from(path);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+}
+
+fn selected_branch_from_text(text: Option<&str>) -> UpdateBranch {
+    text.and_then(|text| UpdateBranch::parse(text).ok())
+        .unwrap_or_default()
+}
+
+fn save_current_branch(branch: UpdateBranch) -> Result<()> {
+    let path = channel_path().ok_or_else(|| {
+        anyhow!("cannot locate the AMPH config directory to save the update channel")
+    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("invalid update channel path {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("cannot create {}", parent.display()))?;
+
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temporary, format!("{}\n", branch.as_str()))
+        .with_context(|| format!("cannot write {}", temporary.display()))?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("cannot replace {}", path.display()));
+    }
+    Ok(())
+}
+
+fn cache_path(branch: UpdateBranch) -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
-    Some(base.join("amph").join("update-check"))
+    Some(base.join("amph").join(cache_file_name(branch)))
 }
 
-fn read_cached_version() -> Option<(u64, String)> {
-    let text = fs::read_to_string(cache_path()?).ok()?;
+fn cache_file_name(branch: UpdateBranch) -> String {
+    format!("update-check-{}", branch.as_str())
+}
+
+fn read_cached_version(branch: UpdateBranch) -> Option<(u64, String)> {
+    let text = fs::read_to_string(cache_path(branch)?).ok()?;
+    parse_cached_version(&text)
+}
+
+fn parse_cached_version(text: &str) -> Option<(u64, String)> {
     let mut lines = text.lines();
     let checked_at = lines.next()?.trim().parse::<u64>().ok()?;
     let version = lines.next()?.trim();
@@ -178,8 +309,8 @@ fn read_cached_version() -> Option<(u64, String)> {
     Some((checked_at, version.to_string()))
 }
 
-fn write_cached_version(version: &str) {
-    let Some(path) = cache_path() else {
+fn write_cached_version(branch: UpdateBranch, version: &str) {
+    let Some(path) = cache_path(branch) else {
         return;
     };
     if let Some(parent) = path.parent()
@@ -197,12 +328,19 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn fetch_latest_version(timeout: Duration) -> Result<String> {
-    let manifest = fetch_manifest(timeout)?;
+fn fetch_latest_version(branch: UpdateBranch, timeout: Duration) -> Result<String> {
+    let manifest = fetch_manifest(branch, timeout)?;
     parse_package_version(&manifest)
 }
 
-fn fetch_manifest(timeout: Duration) -> Result<String> {
+fn manifest_url(branch: UpdateBranch) -> String {
+    format!(
+        "https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/{}/Cargo.toml",
+        branch.as_str()
+    )
+}
+
+fn fetch_manifest(branch: UpdateBranch, timeout: Duration) -> Result<String> {
     let timeout_secs = timeout.as_secs().max(1).to_string();
     let connect_secs = (timeout.as_secs().max(1) / 2).max(1).to_string();
     let max_bytes = MAX_MANIFEST_BYTES.to_string();
@@ -224,7 +362,7 @@ fn fetch_manifest(timeout: Duration) -> Result<String> {
         .arg(max_bytes)
         .arg("--user-agent")
         .arg(concat!("amph/", env!("CARGO_PKG_VERSION")))
-        .arg(MANIFEST_URL)
+        .arg(manifest_url(branch))
         .output()
         .context(
             "cannot run curl to check for updates; install curl or set AMPH_NO_UPDATE_CHECK=1",
@@ -329,14 +467,18 @@ fn permission_hint(root: Option<&Path>) -> String {
     }
 }
 
-fn update_available_from(current: &str, latest: &str) -> Result<Option<UpdateAvailable>> {
+fn update_available_from(
+    current: &str,
+    latest: &str,
+    branch: UpdateBranch,
+) -> Result<Option<UpdateAvailable>> {
     let current_version = Version::parse(current)?;
     let latest_version = Version::parse(latest)?;
     if latest_version > current_version {
         Ok(Some(UpdateAvailable {
             current: current.to_string(),
             latest: latest.to_string(),
-            branch: BRANCH,
+            branch: branch.as_str(),
             repository: REPOSITORY,
         }))
     } else {
@@ -506,17 +648,17 @@ serde = { version = "1", features = ["derive"] }
     #[test]
     fn updates_are_only_reported_for_a_newer_version() {
         assert!(
-            update_available_from("0.2.0-beta", "0.3.0-beta")
+            update_available_from("0.2.0-beta", "0.3.0-beta", UpdateBranch::Main)
                 .unwrap()
                 .is_some()
         );
         assert!(
-            update_available_from("0.3.0-beta", "0.3.0-beta")
+            update_available_from("0.3.0-beta", "0.3.0-beta", UpdateBranch::Main)
                 .unwrap()
                 .is_none()
         );
         assert!(
-            update_available_from("0.3.0", "0.3.0-beta")
+            update_available_from("0.3.0", "0.3.0-beta", UpdateBranch::Main)
                 .unwrap()
                 .is_none()
         );
@@ -527,5 +669,66 @@ serde = { version = "1", features = ["derive"] }
         for value in ["", "1", "1.2", "1.2.3.4", "x.2.3", "1.2.3-"] {
             assert!(Version::parse(value).is_err(), "{value} should be invalid");
         }
+    }
+
+    #[test]
+    fn branch_parsing_accepts_only_known_channels() {
+        assert_eq!(UpdateBranch::parse("main").unwrap(), UpdateBranch::Main);
+        assert_eq!(
+            UpdateBranch::parse("  development\n").unwrap(),
+            UpdateBranch::Development
+        );
+        for value in ["", "Main", "dev", "staging", "main development"] {
+            assert!(
+                UpdateBranch::parse(value).is_err(),
+                "{value:?} must not select a channel"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_or_invalid_selection_defaults_to_main() {
+        assert_eq!(selected_branch_from_text(None), UpdateBranch::Main);
+        assert_eq!(selected_branch_from_text(Some("")), UpdateBranch::Main);
+        assert_eq!(
+            selected_branch_from_text(Some("staging\n")),
+            UpdateBranch::Main
+        );
+        assert_eq!(
+            selected_branch_from_text(Some("development\n")),
+            UpdateBranch::Development
+        );
+        assert_eq!(UpdateBranch::default(), UpdateBranch::Main);
+    }
+
+    #[test]
+    fn update_checks_are_cached_per_channel() {
+        let main = cache_file_name(UpdateBranch::Main);
+        let development = cache_file_name(UpdateBranch::Development);
+        assert_eq!(main, "update-check-main");
+        assert_eq!(development, "update-check-development");
+        assert_ne!(main, development);
+        assert_eq!(UpdateBranch::ALL.map(cache_file_name), [main, development]);
+    }
+
+    #[test]
+    fn cached_versions_are_read_from_the_channel_file() {
+        assert_eq!(
+            parse_cached_version("1700000000\n0.4.0\n"),
+            Some((1_700_000_000, "0.4.0".to_string()))
+        );
+        assert_eq!(parse_cached_version("not-a-time\n0.4.0\n"), None);
+        assert_eq!(parse_cached_version("1700000000\n\n"), None);
+    }
+
+    #[test]
+    fn manifest_urls_and_updates_carry_the_selected_branch() {
+        assert!(manifest_url(UpdateBranch::Main).ends_with("/main/Cargo.toml"));
+        assert!(manifest_url(UpdateBranch::Development).ends_with("/development/Cargo.toml"));
+        let available = update_available_from("0.3.0", "0.4.0", UpdateBranch::Development)
+            .unwrap()
+            .expect("newer version");
+        assert_eq!(available.branch, "development");
+        assert_eq!(available.repository, REPOSITORY);
     }
 }

@@ -48,6 +48,9 @@ pub fn render(frame: &mut Frame, app: &mut App, screen: Rect) {
         Overlay::UpdateResult(state) => {
             crate::tui::views::update::render_result(frame, screen, app, state);
         }
+        Overlay::ChannelPicker => {
+            crate::tui::views::update::render_channel_picker(frame, screen, app);
+        }
     }
 }
 
@@ -111,6 +114,7 @@ fn render_help(frame: &mut Frame, screen: Rect, app: &App) {
             key_line("p", "preview cleanup", theme),
             key_line("i", "inspect panel", theme),
             key_line("u", "update AMPH", theme),
+            key_line("shift+v", "update channel", theme),
             key_line("t", "cycle theme", theme),
             key_line("q", "quit", theme),
             Line::from(""),
@@ -145,6 +149,7 @@ fn render_help(frame: &mut Frame, screen: Rect, app: &App) {
         help_heading("INTERFACE", theme),
         key_line("i", "toggle inspect panel", theme),
         key_line("u", "review / install update", theme),
+        key_line("shift+v", "switch update channel", theme),
         key_line("t / T", "next / previous theme", theme),
         key_line("q", "quit", theme),
     ];
@@ -169,6 +174,15 @@ fn render_help(frame: &mut Frame, screen: Rect, app: &App) {
         )),
         help_heading("UPDATE", theme),
         key_line("u", "review / install", theme),
+        key_line("shift+v", "channel picker", theme),
+        Line::from(Span::styled(
+            "main · stable",
+            Style::default().fg(theme.text),
+        )),
+        Line::from(Span::styled(
+            "development · newer builds",
+            Style::default().fg(theme.text),
+        )),
         Line::from(Span::styled(
             "Restart AMPH after installing.",
             Style::default().fg(theme.warning),

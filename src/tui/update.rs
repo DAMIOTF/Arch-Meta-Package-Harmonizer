@@ -4,12 +4,19 @@
 //! result with [`crate::tui::ScanMessage::UpdateAvailable`], and the interface
 //! shows it without interrupting the screen in use.
 //!
+//! An update belongs to a branch: `main` is the stable channel and
+//! `development` carries newer builds. The host reports the persisted channel
+//! with [`crate::tui::ScanMessage::UpdateChannel`] at startup, and every
+//! [`UpdateInfo`] and [`UpdateRequest`] carries the branch it refers to so a
+//! notification can never be mistaken for another channel.
+//!
 //! Installing is a one-shot callback. The TUI **never** downloads or executes an
 //! installer itself: it sends [`UpdateRequest::Install`] to an injected
 //! [`UpdateHandler`] and the host decides how to install. The handler runs on
 //! the main thread with the terminal suspended (raw mode, mouse capture, and the
 //! alternate screen restored), so a host installer may print progress or ask for
-//! privilege escalation.
+//! privilege escalation. Switching channels uses the same callback: the host
+//! persists the branch and installs its latest build.
 //!
 //! The interface only reports that the handler finished. A running process
 //! cannot replace its own executable in place, so the UI then asks the user to
@@ -31,6 +38,26 @@
 //! run_with_theme_and_update(scan, theme, cleanup, update)?;
 //! ```
 
+/// Branch used when a host does not name an update channel.
+pub const DEFAULT_CHANNEL: &str = "main";
+
+/// Selectable update channels, in presentation order.
+pub const UPDATE_CHANNELS: [&str; 2] = [DEFAULT_CHANNEL, "development"];
+
+/// Normalize a channel name received from the host or chosen in the interface.
+///
+/// Channel names are Git branch names. Surrounding whitespace is discarded and
+/// an empty value falls back to [`DEFAULT_CHANNEL`]; unknown non-empty names
+/// are preserved so a host can add a channel without changing the TUI.
+pub fn normalize_channel(branch: impl AsRef<str>) -> String {
+    let branch = branch.as_ref().trim();
+    if branch.is_empty() {
+        DEFAULT_CHANNEL.to_string()
+    } else {
+        branch.to_string()
+    }
+}
+
 /// A newer version announced by the host's background check.
 ///
 /// The host has already compared versions; the TUI displays the two values and
@@ -39,6 +66,7 @@
 pub struct UpdateInfo {
     current: String,
     latest: String,
+    branch: String,
     url: Option<String>,
     notes: Option<String>,
 }
@@ -48,9 +76,19 @@ impl UpdateInfo {
         Self {
             current: current.into().trim().to_string(),
             latest: latest.into().trim().to_string(),
+            branch: DEFAULT_CHANNEL.to_string(),
             url: None,
             notes: None,
         }
+    }
+
+    /// Attach the channel the announced build is published on.
+    ///
+    /// The host should set this from the same persisted channel it used for the
+    /// check. A missing or blank value falls back to `main`.
+    pub fn with_branch(mut self, branch: impl Into<String>) -> Self {
+        self.branch = normalize_channel(branch.into());
+        self
     }
 
     /// Attach a release page or changelog URL shown in the prompt.
@@ -80,6 +118,11 @@ impl UpdateInfo {
         &self.latest
     }
 
+    /// The channel this build was published on.
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
     pub fn url(&self) -> Option<&str> {
         self.url.as_deref()
     }
@@ -97,19 +140,31 @@ impl UpdateInfo {
 /// A request sent from the TUI to the injected update handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateRequest {
-    Install { version: String },
+    Install { version: String, branch: String },
 }
 
 impl UpdateRequest {
-    pub fn install(version: impl Into<String>) -> Self {
+    /// Ask the host to persist `branch` and install its latest build.
+    ///
+    /// Channel switches use a descriptive version such as
+    /// `latest development build`. The host owns persistence and installation.
+    pub fn install(version: impl Into<String>, branch: impl Into<String>) -> Self {
         Self::Install {
             version: version.into(),
+            branch: normalize_channel(branch.into()),
         }
     }
 
     pub fn version(&self) -> &str {
         match self {
-            UpdateRequest::Install { version } => version,
+            UpdateRequest::Install { version, .. } => version,
+        }
+    }
+
+    /// The branch the host must persist and install from.
+    pub fn branch(&self) -> &str {
+        match self {
+            UpdateRequest::Install { branch, .. } => branch,
         }
     }
 }
@@ -206,6 +261,7 @@ mod tests {
             .with_notes("  Faster scans.  ");
         assert_eq!(info.current(), "0.2.0-beta");
         assert_eq!(info.latest(), "0.3.0");
+        assert_eq!(info.branch(), DEFAULT_CHANNEL);
         assert_eq!(info.url(), Some("https://example.invalid/release"));
         assert_eq!(info.notes(), Some("Faster scans."));
         assert!(info.is_actionable());
@@ -213,12 +269,39 @@ mod tests {
     }
 
     #[test]
+    fn update_info_carries_and_normalizes_its_channel() {
+        let info = UpdateInfo::new("0.3.0", "0.4.0").with_branch("  development ");
+        assert_eq!(info.branch(), "development");
+
+        // A host that cannot name a channel must not produce a blank one.
+        assert_eq!(
+            UpdateInfo::new("0.3.0", "0.4.0").with_branch(" ").branch(),
+            DEFAULT_CHANNEL
+        );
+    }
+
+    #[test]
+    fn install_request_carries_version_and_branch() {
+        let request = UpdateRequest::install("latest development build", " development ");
+        assert_eq!(request.version(), "latest development build");
+        assert_eq!(request.branch(), "development");
+
+        assert_eq!(
+            UpdateRequest::install("0.3.0", "").branch(),
+            DEFAULT_CHANNEL
+        );
+    }
+
+    #[test]
     fn closure_is_an_update_handler() {
         let mut handler = |request: UpdateRequest| {
             assert_eq!(request.version(), "0.3.0");
+            assert_eq!(request.branch(), "main");
             Ok(UpdateOutcome::new(true, "installed"))
         };
-        let outcome = handler.handle(UpdateRequest::install("0.3.0")).unwrap();
+        let outcome = handler
+            .handle(UpdateRequest::install("0.3.0", "main"))
+            .unwrap();
         assert!(outcome.success);
     }
 
@@ -226,7 +309,7 @@ mod tests {
     fn read_only_handler_refuses_installs() {
         let mut handler = ReadOnlyUpdateHandler;
         let error = handler
-            .handle(UpdateRequest::install("0.3.0"))
+            .handle(UpdateRequest::install("0.3.0", "main"))
             .expect_err("read-only updates");
         assert!(error.message().contains("No update installer"));
     }

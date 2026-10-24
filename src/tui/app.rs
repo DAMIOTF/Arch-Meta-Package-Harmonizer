@@ -14,7 +14,10 @@ use crate::tui::event::{InputEvent, ScanMessage};
 use crate::tui::metrics::{self, Analysis, Check, GraphData, Metrics};
 use crate::tui::model::{Package, Snapshot, TimelineItem, format_size};
 use crate::tui::theme::{Theme, ThemeKind};
-use crate::tui::update::{UpdateError, UpdateInfo, UpdateOutcome, UpdateRequest};
+use crate::tui::update::{
+    DEFAULT_CHANNEL, UPDATE_CHANNELS, UpdateError, UpdateInfo, UpdateOutcome, UpdateRequest,
+    normalize_channel,
+};
 
 pub const TAB_COUNT: usize = 7;
 
@@ -227,6 +230,9 @@ pub enum Overlay {
     UpdatePrompt,
     UpdateBusy,
     UpdateResult(UpdateResultState),
+    /// Channel selection opened with `Shift+V`. The highlighted row lives in
+    /// [`App::channel_cursor`] so a host channel update cannot move it.
+    ChannelPicker,
 }
 
 impl Overlay {
@@ -503,6 +509,10 @@ pub struct App {
     pub(crate) update: Option<UpdateNotice>,
     pub(crate) update_queue: VecDeque<UpdateRequest>,
     pub(crate) update_enabled: bool,
+    /// The channel the host has persisted, mirrored locally for display.
+    pub(crate) update_channel: String,
+    /// Highlighted row while the channel picker is open.
+    pub(crate) channel_cursor: usize,
     pub(crate) filter_edit: Option<FilterEdit>,
     pub(crate) overlay: Overlay,
     pub(crate) scan: ScanState,
@@ -549,6 +559,8 @@ impl App {
             update: None,
             update_queue: VecDeque::new(),
             update_enabled: false,
+            update_channel: DEFAULT_CHANNEL.to_string(),
+            channel_cursor: 0,
             filter_edit: None,
             overlay: Overlay::None,
             scan: ScanState::new(),
@@ -658,6 +670,9 @@ impl App {
             }
             ScanMessage::Snapshot(snapshot) => {
                 self.install_snapshot(snapshot);
+            }
+            ScanMessage::UpdateChannel(branch) => {
+                self.on_update_channel(branch);
             }
             ScanMessage::UpdateAvailable(info) => {
                 self.on_update_available(info);
@@ -791,6 +806,24 @@ impl App {
     // Update flow
     // ---------------------------------------------------------------------
 
+    fn on_update_channel(&mut self, branch: String) {
+        let branch = normalize_channel(branch);
+        if branch == self.update_channel {
+            return;
+        }
+        self.update_channel = branch.clone();
+        // The picker cursor follows the host only while the picker is closed.
+        // Moving it during navigation would make the highlighted row jump.
+        if matches!(self.overlay, Overlay::None) {
+            self.channel_cursor = channel_index(&branch);
+        }
+        self.log_event(
+            SessionEventKind::Interface,
+            "Update channel",
+            format!("{branch} is the selected update channel."),
+        );
+    }
+
     fn on_update_available(&mut self, info: UpdateInfo) {
         if !info.is_actionable() {
             self.log_event(
@@ -806,27 +839,47 @@ impl App {
             return;
         }
 
+        // A check may finish after the user switched channels. Never show an
+        // announcement for a channel that is no longer selected: choosing a
+        // branch always installs, and a stale result would be misleading.
+        if info.branch() != self.update_channel {
+            self.log_event(
+                SessionEventKind::Interface,
+                "Update notice ignored",
+                format!(
+                    "{} was reported on the {} channel, but {} is selected.",
+                    info.latest(),
+                    info.branch(),
+                    self.update_channel
+                ),
+            );
+            return;
+        }
+
         if let Some(existing) = &self.update {
             if existing.installed() {
                 return;
             }
-            if existing.info().latest() == info.latest() {
+            if existing.info().latest() == info.latest()
+                && existing.info().branch() == info.branch()
+            {
                 return;
             }
         }
 
         let current = info.current().to_string();
         let latest = info.latest().to_string();
+        let branch = info.branch().to_string();
         self.update = Some(UpdateNotice::available(info));
         self.toast(
-            &format!("Update available · {latest} · press u"),
+            &format!("Update available · {latest} · {branch} · press u"),
             ToastTone::Warning,
         );
         self.log_event(
             SessionEventKind::Interface,
             "Update available",
             format!(
-                "GitHub main reports {latest}; this session runs {current}. Press u to review."
+                "The GitHub {branch} channel reports {latest}; this session runs {current}. Press u to review."
             ),
         );
     }
@@ -873,14 +926,77 @@ impl App {
             return false;
         };
         let version = notice.info().latest().to_string();
+        let branch = notice.info().branch().to_string();
         self.update_queue
-            .push_back(UpdateRequest::install(version.clone()));
+            .push_back(UpdateRequest::install(version.clone(), branch.clone()));
         self.overlay = Overlay::UpdateBusy;
         self.log_event(
             SessionEventKind::Safety,
             "Update install requested",
             format!(
-                "{version} sent to the injected handler. The terminal is suspended while it runs; the TUI executes nothing itself."
+                "{version} from the {branch} channel sent to the injected handler. The terminal is suspended while it runs; the TUI executes nothing itself."
+            ),
+        );
+        true
+    }
+
+    fn open_channel_picker(&mut self) {
+        self.channel_cursor = channel_index(&self.update_channel);
+        self.overlay = Overlay::ChannelPicker;
+        self.log_event(
+            SessionEventKind::Interface,
+            "Channel picker opened",
+            "Choosing a branch installs its latest build through the injected handler.",
+        );
+    }
+
+    /// Select `branch`, remembering it locally and asking the host to install.
+    ///
+    /// Returns `true` when the picker should close: either the channel is
+    /// already selected (a safe no-op) or the install request was queued.
+    /// Returns `false` when no installer is attached and the picker should stay
+    /// open so the user can see why nothing happened.
+    fn choose_channel(&mut self, branch: &str) -> bool {
+        if branch == self.update_channel {
+            self.overlay = Overlay::None;
+            self.toast(
+                &format!("{branch} is already the current channel"),
+                ToastTone::Info,
+            );
+            self.log_event(
+                SessionEventKind::Interface,
+                "Channel unchanged",
+                format!("{branch} is already selected. No install was requested."),
+            );
+            return true;
+        }
+
+        if !self.update_enabled {
+            self.toast(
+                "No update installer is attached to this session",
+                ToastTone::Warning,
+            );
+            self.log_event(
+                SessionEventKind::Warning,
+                "Channel switch unavailable",
+                "No update handler is attached, so the channel was not changed.",
+            );
+            return false;
+        }
+
+        let version = format!("latest {branch} build");
+        self.update_channel = branch.to_string();
+        // The old notice belongs to the previous channel and must not remain
+        // on screen as if it still described the selected branch.
+        self.update = None;
+        self.update_queue
+            .push_back(UpdateRequest::install(version.clone(), branch));
+        self.overlay = Overlay::UpdateBusy;
+        self.log_event(
+            SessionEventKind::Safety,
+            "Channel install requested",
+            format!(
+                "{branch} selected. {version} sent to the injected handler, which saves the channel and installs it. The TUI executes nothing itself."
             ),
         );
         true
@@ -1001,6 +1117,13 @@ impl App {
             KeyCode::Char('t') => self.cycle_theme(true),
             KeyCode::Char('T') => self.cycle_theme(false),
             KeyCode::Char('i') => self.toggle_detail(),
+            KeyCode::Char('V')
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !control
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.open_channel_picker();
+            }
             KeyCode::Char('u') => self.open_update_prompt(),
             KeyCode::Char('s') if self.active_tab == Tab::Packages => self.cycle_sort(),
             KeyCode::Char(' ') if self.active_tab == Tab::Graph => {
@@ -1146,6 +1269,37 @@ impl App {
                     self.overlay = Overlay::CleanupError(state);
                 }
             },
+            Overlay::ChannelPicker => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('V') => {
+                        self.log_event(
+                            SessionEventKind::Interface,
+                            "Channel picker closed",
+                            "No channel change was requested.",
+                        );
+                        return;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.channel_cursor = self.channel_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.channel_cursor =
+                            (self.channel_cursor + 1).min(UPDATE_CHANNELS.len() - 1);
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => self.channel_cursor = 0,
+                    KeyCode::End | KeyCode::Char('G') => {
+                        self.channel_cursor = UPDATE_CHANNELS.len() - 1;
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        let branch = UPDATE_CHANNELS[self.channel_cursor];
+                        if self.choose_channel(branch) {
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+                self.overlay = Overlay::ChannelPicker;
+            }
             Overlay::UpdatePrompt => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('u') => {
@@ -1939,6 +2093,19 @@ impl App {
         self.update_enabled
     }
 
+    /// The channel the host currently has selected.
+    pub fn update_channel(&self) -> &str {
+        &self.update_channel
+    }
+
+    /// The branch highlighted in the open channel picker.
+    pub fn highlighted_channel(&self) -> &'static str {
+        UPDATE_CHANNELS
+            .get(self.channel_cursor)
+            .copied()
+            .unwrap_or(DEFAULT_CHANNEL)
+    }
+
     pub fn stale_snapshot(&self) -> bool {
         self.stale_snapshot
     }
@@ -2016,6 +2183,13 @@ impl Default for App {
     }
 }
 
+fn channel_index(branch: &str) -> usize {
+    UPDATE_CHANNELS
+        .iter()
+        .position(|candidate| *candidate == branch)
+        .unwrap_or(0)
+}
+
 fn clamp_table(state: &mut TableState, len: usize) {
     if len == 0 {
         state.select(None);
@@ -2045,6 +2219,10 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn shift_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
     }
 
     fn ready_cleanup_app(enabled: bool) -> App {
@@ -2194,6 +2372,7 @@ mod tests {
 
     fn update_info() -> UpdateInfo {
         UpdateInfo::new("0.2.0-beta", "0.3.0")
+            .with_branch("main")
             .with_url("https://example.invalid/amph/releases")
             .with_notes("Faster package scans.")
     }
@@ -2252,6 +2431,7 @@ mod tests {
 
         let request = app.take_update_request().expect("install request");
         assert_eq!(request.version(), "0.3.0");
+        assert_eq!(request.branch(), "main");
         assert!(matches!(app.overlay, Overlay::UpdateBusy));
 
         // Modal keys cannot dismiss or duplicate work while the handler runs.
@@ -2463,6 +2643,184 @@ mod tests {
         let screen = screen_text(&terminal);
         assert!(screen.contains("RESTART AMPH"));
         assert!(screen.contains("installed to ~/.cargo/bin"));
+    }
+
+    #[test]
+    fn shift_v_opens_the_channel_picker_and_marks_the_current_channel() {
+        let mut app = App::new();
+        app.set_update_enabled(true);
+        app.on_scan_message(ScanMessage::update_channel(" main "));
+        assert_eq!(app.update_channel(), "main");
+
+        app.on_key(shift_key(KeyCode::Char('V')));
+
+        assert!(matches!(app.overlay, Overlay::ChannelPicker));
+        assert_eq!(app.highlighted_channel(), "main");
+
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| crate::tui::views::draw(frame, &mut app))
+            .expect("picker frame");
+
+        let screen = screen_text(&terminal);
+        assert!(screen.contains("UPDATE CHANNEL"));
+        assert!(screen.contains("SELECT A CHANNEL"));
+        assert!(screen.contains("CURRENT  main"));
+        assert!(screen.contains("development"));
+        assert!(screen.contains("choose"));
+
+        app.on_key(key(KeyCode::Esc));
+        terminal
+            .draw(|frame| crate::tui::views::draw(frame, &mut app))
+            .expect("closed picker frame");
+        assert!(screen_text(&terminal).contains("shift+v channel"));
+    }
+
+    #[test]
+    fn channel_picker_renders_on_compact_terminals() {
+        let mut app = App::new();
+        app.set_update_enabled(true);
+        app.on_scan_message(ScanMessage::update_channel("main"));
+
+        for (width, height) in [(40, 12), (64, 20), (80, 24)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            app.on_key(shift_key(KeyCode::Char('V')));
+            terminal
+                .draw(|frame| crate::tui::views::draw(frame, &mut app))
+                .expect("compact picker frame");
+            app.on_key(key(KeyCode::Esc));
+            assert!(matches!(app.overlay, Overlay::None));
+        }
+    }
+
+    #[test]
+    fn choosing_development_requests_an_install_from_that_branch() {
+        let mut app = App::new();
+        app.set_update_enabled(true);
+        app.on_scan_message(ScanMessage::update_channel("main"));
+        app.on_key(shift_key(KeyCode::Char('V')));
+        app.on_key(key(KeyCode::Char('j')));
+
+        assert_eq!(app.highlighted_channel(), "development");
+        app.on_key(key(KeyCode::Enter));
+
+        assert!(matches!(app.overlay, Overlay::UpdateBusy));
+        assert_eq!(app.update_channel(), "development");
+        let request = app.take_update_request().expect("branch install request");
+        assert_eq!(request.version(), "latest development build");
+        assert_eq!(request.branch(), "development");
+
+        app.on_update_handler_result(
+            &request,
+            Ok(UpdateOutcome::new(true, "installed from development")),
+        );
+        assert!(matches!(app.overlay, Overlay::UpdateResult(_)));
+
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| crate::tui::views::draw(frame, &mut app))
+            .expect("branch result frame");
+        let screen = screen_text(&terminal);
+        assert!(screen.contains("RESTART AMPH"));
+        assert!(screen.contains("latest development build"));
+    }
+
+    #[test]
+    fn choosing_the_current_channel_is_a_safe_no_op() {
+        let mut app = App::new();
+        app.set_update_enabled(true);
+        app.on_scan_message(ScanMessage::update_channel("main"));
+        app.on_key(shift_key(KeyCode::Char('V')));
+
+        app.on_key(key(KeyCode::Enter));
+
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(app.update_channel(), "main");
+        assert!(app.take_update_request().is_none());
+        assert!(
+            app.active_toast()
+                .is_some_and(|toast| toast.text.contains("already the current channel"))
+        );
+    }
+
+    #[test]
+    fn shift_v_does_not_hijack_filter_typing() {
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Char('/')));
+
+        app.on_key(shift_key(KeyCode::Char('V')));
+
+        assert!(app.filter_edit().is_some());
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(app.active_filter(), "V");
+    }
+
+    #[test]
+    fn channel_picker_navigates_without_selecting() {
+        let mut app = App::new();
+        app.set_update_enabled(true);
+        app.on_scan_message(ScanMessage::update_channel("development"));
+        app.on_key(shift_key(KeyCode::Char('V')));
+        assert_eq!(app.highlighted_channel(), "development");
+
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(app.highlighted_channel(), "main");
+        assert!(matches!(app.overlay, Overlay::ChannelPicker));
+        assert!(app.take_update_request().is_none());
+
+        app.on_key(key(KeyCode::Enter));
+        // main is now a different channel, so Enter requests its build.
+        let request = app.take_update_request().expect("main install request");
+        assert_eq!(request.version(), "latest main build");
+        assert_eq!(request.branch(), "main");
+    }
+
+    #[test]
+    fn update_notice_is_bound_to_the_selected_channel() {
+        let mut app = App::new();
+        app.set_update_enabled(true);
+        app.on_scan_message(ScanMessage::update_channel("development"));
+        app.on_scan_message(ScanMessage::update_available(
+            UpdateInfo::new("0.3.0-beta", "0.4.0-beta").with_branch("development"),
+        ));
+
+        assert_eq!(
+            app.update_notice().expect("notice").info().branch(),
+            "development"
+        );
+
+        // A late background check from another channel must not replace the
+        // notice for the selected branch.
+        app.on_scan_message(ScanMessage::update_available(update_info()));
+        assert_eq!(
+            app.update_notice().expect("notice").info().branch(),
+            "development"
+        );
+
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| crate::tui::views::draw(frame, &mut app))
+            .expect("development notice frame");
+        let screen = screen_text(&terminal);
+        assert!(screen.contains("CHANNEL DEVELOPMENT"));
+        assert!(screen.contains("development"));
+
+        app.on_key(key(KeyCode::Char('u')));
+        terminal
+            .draw(|frame| crate::tui::views::draw(frame, &mut app))
+            .expect("development prompt frame");
+        let prompt = screen_text(&terminal);
+        assert!(prompt.contains("DEVELOPMENT CHANNEL"));
+        assert!(prompt.contains("development branch"));
+
+        app.on_key(key(KeyCode::Enter));
+        let request = app.take_update_request().expect("development install");
+        assert_eq!(request.version(), "0.4.0-beta");
+        assert_eq!(request.branch(), "development");
     }
 
     #[test]

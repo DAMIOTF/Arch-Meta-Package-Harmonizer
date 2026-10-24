@@ -1,11 +1,12 @@
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 use crate::tui::app::{App, UpdateResultState};
 use crate::tui::theme::Theme;
+use crate::tui::update::UPDATE_CHANNELS;
 use crate::tui::widgets;
 
 /// One-line, non-blocking notice under the tab bar.
@@ -119,7 +120,7 @@ pub fn banner(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let line = Line::from(left);
     let left_width = line.width() as u16;
-    let right = "GITHUB MAIN ";
+    let right = format!("CHANNEL {} ", notice.info().branch().to_ascii_uppercase());
     let right_width = right.chars().count() as u16;
     frame.render_widget(Paragraph::new(line), area);
 
@@ -138,6 +139,199 @@ pub fn banner(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// Modal channel picker opened with `Shift+V`.
+///
+/// The selected channel is marked with a filled dot and a `current` tag. The
+/// action line states exactly what Enter will do, including the safe no-op when
+/// the highlighted channel is already selected.
+pub fn render_channel_picker(frame: &mut Frame, screen: Rect, app: &App) {
+    let theme = &app.theme;
+    let stage = stage(app, screen);
+    let area = widgets::centered_rect_height(stage, 72, 13);
+    frame.render_widget(Clear, area);
+    let block = widgets::accent_panel("Update channel · shift+v close", theme, theme.info);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let content = inner.inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(UPDATE_CHANNELS.len() as u16),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(content);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "SELECT A CHANNEL",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ·  ", Style::default().fg(theme.border)),
+            Span::styled("installs immediately", Style::default().fg(theme.muted)),
+        ])),
+        rows[0],
+    );
+
+    frame.render_widget(
+        Paragraph::new(
+            "Switching fetches the latest build from that branch and installs it. \
+             The host saves the channel; restart AMPH afterwards to load the new build.",
+        )
+        .style(Style::default().fg(theme.muted))
+        .wrap(Wrap { trim: true }),
+        rows[1],
+    );
+
+    let list = Rect {
+        height: rows[3].height.min(UPDATE_CHANNELS.len() as u16),
+        ..rows[3]
+    };
+    for (index, branch) in UPDATE_CHANNELS
+        .iter()
+        .enumerate()
+        .take(list.height as usize)
+    {
+        let row = Rect {
+            x: list.x,
+            y: list.y + index as u16,
+            width: list.width,
+            height: 1,
+        };
+        let selected = index == app.channel_cursor;
+        let current = *branch == app.update_channel();
+        if selected {
+            frame.render_widget(
+                Block::default().style(Style::default().bg(theme.surface_alt)),
+                row,
+            );
+        }
+
+        let mut name_style = Style::default().fg(theme.text);
+        if selected || current {
+            name_style = name_style.add_modifier(Modifier::BOLD);
+        }
+        let description = match *branch {
+            "main" => "stable releases",
+            "development" => "newer builds, less stable",
+            _ => "alternate channel",
+        };
+        let mut spans = vec![
+            Span::styled(
+                if selected { " › " } else { "   " },
+                Style::default()
+                    .fg(if selected { theme.accent } else { theme.border })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if current { "● " } else { "○ " },
+                Style::default().fg(if current { theme.positive } else { theme.muted }),
+            ),
+            Span::styled(format!("{branch:<13}"), name_style),
+            Span::styled(description, Style::default().fg(theme.muted)),
+        ];
+        if current {
+            spans.push(Span::styled(
+                "  · current",
+                Style::default()
+                    .fg(theme.positive)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), row);
+    }
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(content.width as usize),
+            Style::default().fg(theme.border),
+        )),
+        rows[5],
+    );
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("CURRENT  ", Style::default().fg(theme.muted)),
+            Span::styled(
+                app.update_channel().to_string(),
+                Style::default()
+                    .fg(theme.positive)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  ·  remembered by the host after install",
+                Style::default().fg(theme.muted),
+            ),
+        ])),
+        rows[6],
+    );
+
+    let highlighted = app.highlighted_channel();
+    let action = if highlighted == app.update_channel() {
+        Line::from(vec![
+            Span::styled(
+                " ENTER",
+                Style::default()
+                    .fg(theme.positive)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" close · {highlighted} is already the current channel"),
+                Style::default().fg(theme.text),
+            ),
+        ])
+    } else if app.update_enabled() {
+        Line::from(vec![
+            Span::styled(" ENTER", action_badge(theme)),
+            Span::styled(
+                format!(" install latest {highlighted} build"),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                " INSTALL UNAVAILABLE ",
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "no update installer is attached to this session",
+                Style::default().fg(theme.muted),
+            ),
+        ])
+    };
+    frame.render_widget(Paragraph::new(action).wrap(Wrap { trim: true }), rows[7]);
+
+    let hint = if highlighted == app.update_channel() {
+        "↑/↓ choose · enter close · esc close"
+    } else {
+        "↑/↓ choose · enter install · esc close"
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(hint, Style::default().fg(theme.muted))),
+        rows[8],
+    );
+}
+
 pub fn render_prompt(frame: &mut Frame, screen: Rect, app: &mut App) {
     let Some(notice) = app.update_notice() else {
         return;
@@ -146,7 +340,8 @@ pub fn render_prompt(frame: &mut Frame, screen: Rect, app: &mut App) {
     let stage = stage(app, screen);
     let area = widgets::centered_rect_height(stage, 78, 11);
     frame.render_widget(Clear, area);
-    let block = widgets::accent_panel("Update available · GitHub main", &theme, theme.warning);
+    let title = format!("Update available · {} channel", notice.info().branch());
+    let block = widgets::accent_panel(&title, &theme, theme.warning);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -179,7 +374,10 @@ pub fn render_prompt(frame: &mut Frame, screen: Rect, app: &mut App) {
         ),
     ]);
     let source = Line::from(Span::styled(
-        "A newer build is published on the main branch.",
+        format!(
+            "A newer build is published on the {} branch.",
+            notice.info().branch()
+        ),
         Style::default().fg(theme.muted),
     ));
     frame.render_widget(
@@ -206,7 +404,7 @@ pub fn render_prompt(frame: &mut Frame, screen: Rect, app: &mut App) {
         .info()
         .url()
         .map(str::to_string)
-        .unwrap_or_else(|| "Source: GitHub main".to_string());
+        .unwrap_or_else(|| format!("Source: GitHub {}", notice.info().branch()));
     frame.render_widget(
         Paragraph::new(Span::styled(
             widgets::truncate(&url, inner.width),

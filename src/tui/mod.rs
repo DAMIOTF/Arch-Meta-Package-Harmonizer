@@ -56,47 +56,65 @@
 //!
 //! # Update notifications
 //!
-//! The host checks GitHub `main` in the background on startup. When a newer
-//! version exists it sends [`ScanMessage::UpdateAvailable`] with an
-//! [`UpdateInfo`]. The interface then shows a one-line banner on every tab and
-//! a `u` action; it never opens a modal on its own and never interrupts a scan,
-//! filter, or cleanup flow.
+//! The host selects a persisted update channel (`main` or `development`) and
+//! sends it first with [`ScanMessage::UpdateChannel`]. It then checks that
+//! branch in the background; when a newer version exists it sends
+//! [`ScanMessage::UpdateAvailable`] with an [`UpdateInfo`] carrying the same
+//! branch. The interface shows a one-line banner on every tab and a `u` action;
+//! it never opens a modal on its own and never interrupts a scan, filter, or
+//! cleanup flow. A notice for another channel is ignored so the selected branch
+//! stays authoritative.
 //!
-//! Installing uses an injected [`UpdateHandler`] via
-//! [`run_with_theme_and_update`]. The flow is:
+//! Pressing `shift+v` opens the channel picker. It lists both branches, marks
+//! the current one, and installs the highlighted branch when `Enter` is chosen.
+//! Selecting the already-current channel is a safe no-op with a clear message.
 //!
-//! 1. The user presses `u` and reviews current/latest versions.
-//! 2. `Enter` queues [`UpdateRequest::Install`]; the TUI suspends the terminal
-//!    and calls the host handler on the main thread.
-//! 3. The handler installs the version by its own method and returns
-//!    [`UpdateOutcome`].
+//! Installing, including switching channels, uses an injected [`UpdateHandler`]
+//! via [`run_with_theme_and_update`]. The flow is:
+//!
+//! 1. The user presses `u` to review an announced version, or `shift+v` to pick
+//!    a channel. Both paths use the branch carried by the update or the picker.
+//! 2. `Enter` queues [`UpdateRequest::Install`] with the version and branch; the
+//!    TUI suspends the terminal and calls the host handler on the main thread.
+//! 3. The handler persists the branch, installs the build by its own method, and
+//!    returns [`UpdateOutcome`].
 //! 4. The TUI shows the output and states clearly that AMPH must be restarted
 //!    to load the new version. A persistent `RESTART AMPH` banner remains until
 //!    the session ends.
 //!
 //! The TUI performs no network request and runs no installer itself. Hosts that
 //! do not attach an update handler may still send [`ScanMessage::UpdateAvailable`];
-//! the banner appears but the install action stays disabled.
+//! the banner appears but the install action and channel switch stay disabled.
 //!
 //! ```ignore
+//! // Report the persisted channel before any update check result.
+//! let branch = update::current_branch();
+//! let _ = tx.send(tui::ScanMessage::update_channel(branch.as_str()));
+//!
 //! // Give the update check its own thread so the package scan never waits.
 //! let update_tx = tx.clone();
 //! std::thread::spawn(move || {
 //!     // Only send when the remote is actually newer (`check_for_update` filters).
-//!     if let Ok(Some(found)) = update::check_for_update() {
+//!     if let Ok(Some(found)) = update::check_for_update_on(branch) {
 //!         let info = tui::UpdateInfo::new(found.current, found.latest)
+//!             .with_branch(found.branch)
 //!             .with_url(update::REPOSITORY);
 //!         let _ = update_tx.send(tui::ScanMessage::update_available(info));
 //!     }
 //! });
 //!
 //! // Host installer, called with the terminal suspended.
-//! let installer = |request: tui::UpdateRequest| match update::install_update() {
-//!     Ok(()) => Ok(tui::UpdateOutcome::new(
-//!         true,
-//!         format!("amph {} installed", request.version()),
-//!     )),
-//!     Err(error) => Err(tui::UpdateError::new(format!("{error:#}"))),
+//! let installer = |request: tui::UpdateRequest| {
+//!     match update::UpdateBranch::parse(request.branch()) {
+//!         Ok(branch) => match update::install_update_from_branch(branch) {
+//!             Ok(()) => Ok(tui::UpdateOutcome::new(
+//!                 true,
+//!                 format!("amph {} installed", request.version()),
+//!             )),
+//!             Err(error) => Err(tui::UpdateError::new(format!("{error:#}"))),
+//!         },
+//!         Err(error) => Err(tui::UpdateError::new(format!("{error:#}"))),
+//!     }
 //! };
 //!
 //! tui::run_with_theme_and_update(tui_scan, theme, cleanup, installer)

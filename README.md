@@ -77,10 +77,14 @@ amph blueprint apply workstation.toml # plan only; --execute is explicit
 amph check --json                     # cron-friendly: 0 healthy, 1 warning, 2 critical
 amph timeline --since 7d
 amph cleanup                          # preview only
-amph update                           # check GitHub main, install with Cargo
+amph update                           # check the selected channel, install with Cargo
 ```
 
-At TUI startup, AMPH checks GitHub's `main` branch in the background. When a newer version is available, the update banner appears without interrupting the dashboard; press `u`, then click **Install** or press Enter. After installation, quit and restart AMPH to load the new binary. In human CLI sessions, AMPH prints an update notice to stderr (cached for up to 24 hours); run `amph update` and confirm to install. `amph update --yes` skips confirmation, while `amph update --json` reports availability without installing. The update is built from GitHub `main` with `cargo install --git ... --branch main --locked --force` into the current Cargo root. AMPH never invokes `sudo` for updates. JSON output from other commands is not modified. Set `AMPH_NO_UPDATE_CHECK=1` to disable the CLI notice.
+At TUI startup, AMPH checks the selected GitHub channel in the background. When a newer version is available, the update banner appears without interrupting the dashboard; press `u`, then click **Install** or press Enter. After installation, quit and restart AMPH to load the new binary. In human CLI sessions, AMPH prints an update notice to stderr (cached per channel for up to 24 hours); run `amph update` and confirm to install. `amph update --yes` skips confirmation, while `amph update --json` reports availability without installing. The update is built from the selected channel with `cargo install --git ... --branch <channel> --locked --force` into the current Cargo root. AMPH never invokes `sudo` for updates. JSON output from other commands is not modified. Set `AMPH_NO_UPDATE_CHECK=1` to disable the CLI notice.
+
+### Update channels
+
+Two update channels are available: `main` (the default, stable branch) and `development` (newer, less tested builds). In the TUI, press `Shift+V` to open the channel selector. The selection is persisted in `$XDG_CONFIG_HOME/amph/update-channel` (falling back to `~/.config/amph/update-channel`) and is used by later `amph update` runs and update notices. Selecting a channel installs that Git branch immediately with Cargo, so switching from `main` to `development` (or back) replaces the running binary as part of the switch. If the channel file is missing or invalid, AMPH falls back to `main`.
 
 <img src="https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/2.jpg" alt="dashboard" width="75%" />
 

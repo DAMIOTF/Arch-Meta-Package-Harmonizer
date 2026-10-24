@@ -15,6 +15,9 @@ use super::update::UpdateInfo;
 /// [`ScanMessage::UpdateAvailable`] is independent of the scan lifecycle: a
 /// host may send it before, during, or after the snapshot, and may never send
 /// it when no background update check is configured.
+///
+/// [`ScanMessage::UpdateChannel`] should be the host's first message so the
+/// interface knows which channel is selected before any update notice arrives.
 #[derive(Debug, Clone)]
 pub enum ScanMessage {
     Progress {
@@ -24,6 +27,9 @@ pub enum ScanMessage {
         detail: String,
     },
     Snapshot(Snapshot),
+    /// The channel the host currently has persisted. Sent at startup so the
+    /// interface can mark the selected branch before any update check result.
+    UpdateChannel(String),
     /// A background check found a newer version. The host has already compared
     /// versions; the TUI only presents the result.
     UpdateAvailable(UpdateInfo),
@@ -53,6 +59,11 @@ impl ScanMessage {
 
     pub fn snapshot(snapshot: Snapshot) -> Self {
         Self::Snapshot(snapshot)
+    }
+
+    /// Report the channel the host currently has persisted.
+    pub fn update_channel(branch: impl Into<String>) -> Self {
+        Self::UpdateChannel(branch.into())
     }
 
     pub fn update_available(info: UpdateInfo) -> Self {

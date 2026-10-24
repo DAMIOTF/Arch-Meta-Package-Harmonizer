@@ -94,6 +94,16 @@ fn hints_for(app: &App) -> Vec<(&'static str, &'static str)> {
                 vec![("↑/↓", "scroll"), ("u", "retry"), ("esc", "close")]
             }
         }
+        Overlay::ChannelPicker => {
+            let highlighted = app.highlighted_channel();
+            if highlighted == app.update_channel() {
+                vec![("j/k", "choose"), ("enter", "close"), ("esc", "close")]
+            } else if app.update_enabled() {
+                vec![("j/k", "choose"), ("enter", "install"), ("esc", "close")]
+            } else {
+                vec![("j/k", "choose"), ("esc", "close")]
+            }
+        }
         Overlay::None => match app.active_tab {
             Tab::Dashboard => vec![
                 ("1-7", "tabs"),
@@ -145,20 +155,23 @@ fn hints_for(app: &App) -> Vec<(&'static str, &'static str)> {
         },
     };
 
-    if matches!(app.overlay, Overlay::None)
-        && let Some(notice) = app.update_notice()
-    {
-        hints.insert(
-            0,
-            (
-                "u",
-                if notice.installed() {
-                    "restart"
-                } else {
-                    "update"
-                },
-            ),
-        );
+    if matches!(app.overlay, Overlay::None) {
+        let mut channel_at = 0;
+        if let Some(notice) = app.update_notice() {
+            hints.insert(
+                0,
+                (
+                    "u",
+                    if notice.installed() {
+                        "restart"
+                    } else {
+                        "update"
+                    },
+                ),
+            );
+            channel_at = 1;
+        }
+        hints.insert(channel_at, ("shift+v", "channel"));
     }
 
     hints
@@ -170,7 +183,11 @@ fn footer_right(app: &App) -> String {
         return format!("/{}", widgets::truncate(filter, 18));
     }
 
-    let mut label = app.theme.kind.label().to_string();
+    let mut label = if app.update_enabled() {
+        format!("{} · {}", app.update_channel(), app.theme.kind.label())
+    } else {
+        app.theme.kind.label().to_string()
+    };
     if app.theme.is_monochrome() {
         label.push_str(" · NO_COLOR");
     }
