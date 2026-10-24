@@ -124,7 +124,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 - Versions containing a hyphen, such as `0.2.0-beta` and `0.3.0-beta`, are marked as prereleases.
 - The workflow uses the built-in `GITHUB_TOKEN` with `contents: write` and needs no repository secrets. It refuses to move an existing tag, and reruns update the existing release in place instead of creating a duplicate.
 
-To backfill an older version, run the workflow manually from the Actions tab with the exact `version`, the `target_ref` commit, and optional `release_notes`. For example, backfill `0.2.0-beta` at commit `0766beb` with the notes `0.2.0-beta was previously published on crates.io and is backfilled to GitHub Releases.` The requested version must exactly match `Cargo.toml` at `target_ref`.
+The `workflow_dispatch` inputs can rebuild a release from a ref whose tag already exists. Creating a new tag for a historical commit may be blocked by GitHub's `GITHUB_TOKEN` policy when that commit's `.github/workflows/` files differ from current `main`; the workflow intentionally does not request broader workflow permissions. Such backfills need a separately authorized maintainer process. `0.2.0-beta` has not been backfilled as a GitHub Release.
 
 ## Publishing to crates.io
 
