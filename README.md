@@ -103,9 +103,13 @@ cargo test --locked
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+## Automated publishing
 
+Pushing a `v*` tag triggers `.github/workflows/publish.yml`. The workflow checks that the tag version matches `Cargo.toml`, runs the test suite, and publishes the crate. For each release, bump the Cargo version, commit the change, then push a matching tag, for example `v0.2.1`. The GitHub Actions secret `CARGO_REGISTRY_TOKEN` is required.
 
-<a href='https://ko-fi.com/I2I21ISAGC' target='_blank'><img height='86' style='border:0px;height:86px;' src='https://storage.ko-fi.com/cdn/kofi3.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
+## Support
+
+<a href="https://ko-fi.com/I2I21ISAGC" target="_blank"><img height="86" style="border:0;height:86px" src="https://storage.ko-fi.com/cdn/kofi3.png?v=6" alt="Buy Me a Coffee at ko-fi.com" /></a>
 
 ## License
 
