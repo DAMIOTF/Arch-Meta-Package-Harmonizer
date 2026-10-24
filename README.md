@@ -1,5 +1,5 @@
 # AMPH: Arch Meta Package Harmonizer
-<img src="img/amph_logo_full.png" alt="logo" width="50%" />
+<img src="https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/amph_logo_full.png" alt="AMPH logo" width="50%" />
 
 
 **v0.2-beta · Arch Linux only**
