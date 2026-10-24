@@ -14,6 +14,8 @@
 - **Reproduce:** export, compare and safely plan declarative TOML blueprints.
 - **Automate:** use `--json` output and `amph check` in scripts or cron.
 
+<img src="https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/1.jpg" alt="dashboard" width="75%" />
+
 ## Screenshots
 ![Dashboard](https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/dashboard.png)
 <details>
@@ -76,6 +78,8 @@ amph check --json                     # cron-friendly: 0 healthy, 1 warning, 2 c
 amph timeline --since 7d
 amph cleanup                          # preview only
 ```
+
+<img src="https://raw.githubusercontent.com/DAMIOTF/Arch-Meta-Package-Harmonizer/main/img/2.jpg" alt="dashboard" width="75%" />
 
 Cleanup previews pacman's proposed removal set and requires confirmation to execute. Protected packages (including `base`, `linux` and `pacman`), theme, check thresholds and history retention are configurable in `~/.config/amph/config.toml`:
 
