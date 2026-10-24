@@ -51,7 +51,7 @@
 Install the current beta from crates.io with Cargo:
 
 ```sh
-cargo install amph --version 0.2.0-beta --locked
+cargo install amph --locked
 ```
 
 The installer builds the current release and installs to `$CARGO_HOME/bin` or `~/.cargo/bin` by default. A user install does not need `sudo`.
