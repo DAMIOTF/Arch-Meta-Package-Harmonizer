@@ -61,7 +61,10 @@ pub const MAX_MODULE_BYTES: usize = 2 * 1024 * 1024;
 pub const WASM_PAGE_BYTES: usize = 64 * 1024;
 
 /// Default per-call execution fuel.
-pub const DEFAULT_FUEL: u64 = 20_000_000;
+///
+/// The default supports analysis of several thousand packages while still
+/// bounding untrusted plugin execution to a finite interpreter budget.
+pub const DEFAULT_FUEL: u64 = 100_000_000;
 
 /// Resource limits for validation and execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
