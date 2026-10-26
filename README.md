@@ -40,11 +40,11 @@ It does not run one `pacman -Qi` process per package, and it does not need a bac
 
 ## Features
 
-|  |  |
+| **Observe** | **Act** |
 |:--|:--|
-| **Read the real system**<br><sub>Build the inventory straight from pacman's local database: explicit packages, dependencies, foreign packages, sizes and descriptions. `Provides` is resolved, not ignored.</sub> | **Follow the dependency truth**<br><sub>Trace the shortest path from an explicit root to any package, list the paths that reach it from explicit roots, and see which installed packages depend on it.</sub> |
-| **Preview removal impact**<br><sub>Before removing anything, see the full removal closure, surviving consumers, optional consumers and the reported reclaimable space. Protected packages are skipped and rechecked.</sub> | **Find overlapping tools**<br><sub>Harmony groups packages by purpose, highlights competing tools and suggests alternatives. Add your own categories in a simple TOML file.</sub> |
-| **Make a machine reproducible**<br><sub>Export a declarative blueprint, diff it against the live system, and generate an apply plan. Nothing changes until you explicitly pass `--execute`.</sub> | **Watch the whole system**<br><sub>Health checks, footprint pressure, dependency balance, pacman transaction history and compact scan history — all in one place, with JSON for automation.</sub> |
+| **Read the real system**<br><sub>Build the inventory straight from pacman's local database: explicit packages, dependencies, foreign packages, sizes and descriptions. `Provides` is resolved, not ignored.</sub> | **Preview removal impact**<br><sub>Before removing anything, see the full removal closure, surviving consumers, optional consumers and the reported reclaimable space. Protected packages are skipped and rechecked.</sub> |
+| **Follow the dependency truth**<br><sub>Trace the shortest path from an explicit root to any package, list the paths that reach it from explicit roots, and see which installed packages depend on it.</sub> | **Find overlapping tools**<br><sub>Harmony groups packages by purpose, highlights competing tools and suggests alternatives. Add your own categories in a simple TOML file.</sub> |
+| **Watch the whole system**<br><sub>Health checks, footprint pressure, dependency balance, pacman transaction history and compact scan history — all in one place, with JSON for automation.</sub> | **Make a machine reproducible**<br><sub>Export a declarative blueprint, diff it against the live system, and generate an apply plan. Nothing changes until you explicitly pass `--execute`.</sub> |
 
 ### One snapshot, several answers
 
