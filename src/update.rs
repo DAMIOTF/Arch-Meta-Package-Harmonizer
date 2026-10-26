@@ -600,13 +600,13 @@ mod tests {
         let manifest = r#"
 [package]
 name = "amph"
-version = "0.3.0-beta" # release version
+version = "0.4.0-beta" # release version
 edition = "2024"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 "#;
-        assert_eq!(parse_package_version(manifest).unwrap(), "0.3.0-beta");
+        assert_eq!(parse_package_version(manifest).unwrap(), "0.4.0-beta");
     }
 
     #[test]

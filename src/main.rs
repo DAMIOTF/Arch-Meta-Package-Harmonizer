@@ -36,7 +36,7 @@ use store::HistoryEntry;
 #[derive(Parser)]
 #[command(
     name = "amph",
-    version = "v0.3.0-beta",
+    version = "v0.4.0-beta",
     about = "Arch Meta Package Harmonizer",
     long_about = "Inspect installed Arch Linux packages, trace dependency paths, preview safe removals, check system health, export blueprints and browse a terminal dashboard."
 )]
